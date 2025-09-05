@@ -55,9 +55,10 @@ build:
     # Web interface (may be needed for some components)
     - "gradio"
 
-  # Install the ACE-Step package itself
+  # Install PyTorch and dependencies
   run:
     - "pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu121 torch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1"
+    - "pip install -r requirements.txt"
     - "pip install -e ."
 
 # Predict interface
