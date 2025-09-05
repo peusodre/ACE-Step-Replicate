@@ -1,0 +1,64 @@
+# Configuration for Cog ⚙️
+# Reference: https://github.com/replicate/cog/blob/main/docs/yaml.md
+
+build:
+  # Set CUDA version for GPU acceleration
+  cuda: "12.1"
+
+  # Python version
+  python_version: "3.10"
+
+  # System packages needed for audio processing and dependencies
+  system_packages:
+    - "ffmpeg"
+    - "libsndfile1"
+    - "sox"
+    - "build-essential"
+    - "git"
+    - "curl"
+    - "wget"
+
+  # Python packages from requirements.txt plus cog
+  python_packages:
+    - "cog>=0.9.0"
+    # Core dependencies
+    - "transformers==4.50.0"
+    - "diffusers>=0.33.0"
+    - "accelerate==1.6.0"
+    - "huggingface_hub>=0.23.0"
+    - "safetensors>=0.4.2"
+    - "sentencepiece>=0.1.99"
+    # Audio processing
+    - "librosa==0.11.0"
+    - "soundfile==0.13.1"
+    # Data processing
+    - "datasets==3.4.1"
+    - "numpy"
+    - "matplotlib==3.10.1"
+    # Utilities
+    - "tqdm"
+    - "loguru==0.7.3"
+    - "click"
+    # Language processing
+    - "pypinyin==0.53.0"
+    - "py3langid==0.3.0"
+    - "hangul-romanize==0.1.0"
+    - "num2words==0.5.14"
+    - "spacy==3.8.4"
+    - "cutlet"
+    - "fugashi[unidic-lite]"
+    # Training utilities (optional but may be needed)
+    - "pytorch_lightning==2.5.1"
+    - "peft"
+    - "tensorboard"
+    - "tensorboardX"
+    # Web interface (may be needed for some components)
+    - "gradio"
+
+  # Install the ACE-Step package itself
+  run:
+    - "pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu121 torch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1"
+    - "pip install -e ."
+
+# Predict interface
+predict: "predict.py:Predictor"
