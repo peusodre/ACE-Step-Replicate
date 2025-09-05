@@ -173,13 +173,13 @@ class Predictor(BasePredictor):
         ),
         
         # === REPRODUCIBILITY & VARIATION ===
-        seed: Optional[int] = Input(
-            description="Random seed for reproducible generation (optional)",
-            default=None
+        seed: int = Input(
+            description="Random seed for reproducible generation (-1 for random)",
+            default=-1
         ),
-        variation_seed: Optional[int] = Input(
-            description="Seed for variation generation (creates slight variations)",
-            default=None
+        variation_seed: int = Input(
+            description="Seed for variation generation (-1 for random)",
+            default=-1
         ),
         variation_strength: float = Input(
             description="Strength of variation (0.0 = no variation, 1.0 = maximum variation)",
@@ -250,9 +250,9 @@ class Predictor(BasePredictor):
         final_prompt = style_prompt if style_prompt and task == "style_transfer" else prompt
         final_lyrics = style_lyrics if style_lyrics and task == "style_transfer" else lyrics
         
-        # Set manual seeds
-        manual_seeds = [seed] if seed is not None else None
-        retake_seeds = [variation_seed] if variation_seed is not None else manual_seeds
+        # Set manual seeds (-1 means random)
+        manual_seeds = [seed] if seed != -1 else None
+        retake_seeds = [variation_seed] if variation_seed != -1 else manual_seeds
         
         try:
             # Configure task-specific parameters
