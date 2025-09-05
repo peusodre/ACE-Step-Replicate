@@ -4,10 +4,14 @@ Supports full-length songs, lyric alignment, continuation, style transfer, voice
 """
 
 import os
+import sys
 import tempfile
 import torch
 from typing import Optional, List
 from cog import BasePredictor, Input, Path
+
+# Add the current directory to the Python path so we can import acestep
+sys.path.insert(0, '/src')
 
 from acestep.pipeline_ace_step import ACEStepPipeline
 
