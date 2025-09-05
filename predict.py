@@ -7,8 +7,8 @@ import os
 import sys
 import tempfile
 import torch
-from typing import Optional, List
-from cog import BasePredictor, Input, Path
+from typing import Optional, List, Union
+from cog import BasePredictor, Input, Path, File
 
 # Add the current directory to the Python path so we can import acestep
 sys.path.insert(0, '/src')
@@ -71,13 +71,13 @@ class Predictor(BasePredictor):
         ),
         
         # === AUDIO INPUT FOR ADVANCED TASKS ===
-        input_audio: str = Input(
-            description="Input audio file URL for audio2audio, continuation, inpainting, or style transfer (optional)",
-            default=""
+        input_audio: Optional[File] = Input(
+            description="Input audio file for audio2audio, continuation, inpainting, or style transfer (drag & drop supported)",
+            default=None
         ),
-        reference_audio: str = Input(
-            description="Reference audio file URL for style transfer or voice cloning (optional)",
-            default=""
+        reference_audio: Optional[File] = Input(
+            description="Reference audio file for style transfer or voice cloning (drag & drop supported)",
+            default=None
         ),
         
         # === CONTINUATION & INPAINTING ===
@@ -336,20 +336,20 @@ class Predictor(BasePredictor):
         except Exception as e:
             raise RuntimeError(f"Prediction failed for task '{task}': {str(e)}")
     
-    def _validate_inputs(self, task: str, input_audio: str, reference_audio: str, 
+    def _validate_inputs(self, task: str, input_audio: File, reference_audio: File, 
                         inpaint_start_time: float, inpaint_end_time: float) -> None:
         """Validate inputs based on the selected task."""
         
-        if task in ["audio2audio", "continuation", "inpainting", "style_transfer"] and not input_audio:
+        if task in ["audio2audio", "continuation", "inpainting", "style_transfer"] and input_audio is None:
             raise ValueError(f"Task '{task}' requires input_audio to be provided")
         
         if task == "inpainting" and inpaint_end_time <= inpaint_start_time:
             raise ValueError("inpaint_end_time must be greater than inpaint_start_time")
         
-        if task == "vocal_accompaniment" and not input_audio:
+        if task == "vocal_accompaniment" and input_audio is None:
             raise ValueError("Task 'vocal_accompaniment' requires input_audio with vocals")
     
-    def _configure_task_parameters(self, task: str, input_audio: str, reference_audio: str,
+    def _configure_task_parameters(self, task: str, input_audio: File, reference_audio: File,
                                  continuation_mode: str, inpaint_start_time: float, inpaint_end_time: float,
                                  extend_duration: float, style_strength: float, audio2audio_strength: float,
                                  variation_strength: float, generate_accompaniment: bool, 
@@ -371,7 +371,7 @@ class Predictor(BasePredictor):
             params.update({
                 "task_type": "text2music",
                 "audio2audio_enable": True,
-                "ref_audio_input": input_audio if input_audio else None,
+                "ref_audio_input": str(input_audio) if input_audio else None,
                 "ref_audio_strength": 1.0 - audio2audio_strength,  # ACE-Step uses inverse strength
             })
         
@@ -379,7 +379,7 @@ class Predictor(BasePredictor):
             # Audio continuation/extension
             params.update({
                 "task_type": "extend",
-                "src_audio_path": input_audio if input_audio else None,
+                "src_audio_path": str(input_audio) if input_audio else None,
             })
             
             if continuation_mode == "extend_start":
@@ -402,7 +402,7 @@ class Predictor(BasePredictor):
             # Audio inpainting/editing
             params.update({
                 "task_type": "repaint",
-                "src_audio_path": input_audio if input_audio else None,
+                "src_audio_path": str(input_audio) if input_audio else None,
                 "repaint_start": inpaint_start_time,
                 "repaint_end": inpaint_end_time,
             })
@@ -411,7 +411,7 @@ class Predictor(BasePredictor):
             # Style transfer using edit mode
             params.update({
                 "task_type": "edit",
-                "src_audio_path": input_audio if input_audio else None,
+                "src_audio_path": str(input_audio) if input_audio else None,
                 "edit_n_min": 1.0 - style_strength,  # Higher strength = lower n_min
                 "edit_n_max": 1.0,
                 "edit_n_avg": 1,
@@ -419,7 +419,7 @@ class Predictor(BasePredictor):
             
             if reference_audio:
                 # Use reference audio for style guidance
-                params["ref_audio_input"] = reference_audio
+                params["ref_audio_input"] = str(reference_audio)
                 params["ref_audio_strength"] = 0.3  # Moderate influence
         
         elif task == "vocal_accompaniment":
@@ -427,7 +427,7 @@ class Predictor(BasePredictor):
             # This would require specialized LoRA or controlnet in full implementation
             params.update({
                 "task_type": "text2music",
-                "src_audio_path": input_audio if input_audio else None,
+                "src_audio_path": str(input_audio) if input_audio else None,
             })
             
             # Adjust prompt for accompaniment generation
