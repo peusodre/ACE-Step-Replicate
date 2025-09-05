@@ -71,13 +71,13 @@ class Predictor(BasePredictor):
         ),
         
         # === AUDIO INPUT FOR ADVANCED TASKS ===
-        input_audio: Union[File, str] = Input(
-            description="Input audio file for audio2audio, continuation, inpainting, or style transfer (drag & drop or URL)",
-            default=""
+        input_audio: File = Input(
+            description="Input audio file for audio2audio, continuation, inpainting, or style transfer (drag & drop supported)",
+            default=None
         ),
-        reference_audio: Union[File, str] = Input(
-            description="Reference audio file for style transfer or voice cloning (drag & drop or URL)",
-            default=""
+        reference_audio: File = Input(
+            description="Reference audio file for style transfer or voice cloning (drag & drop supported)",
+            default=None
         ),
         
         # === CONTINUATION & INPAINTING ===
@@ -336,20 +336,20 @@ class Predictor(BasePredictor):
         except Exception as e:
             raise RuntimeError(f"Prediction failed for task '{task}': {str(e)}")
     
-    def _validate_inputs(self, task: str, input_audio: Union[File, str], reference_audio: Union[File, str], 
+    def _validate_inputs(self, task: str, input_audio: File, reference_audio: File, 
                         inpaint_start_time: float, inpaint_end_time: float) -> None:
         """Validate inputs based on the selected task."""
         
-        if task in ["audio2audio", "continuation", "inpainting", "style_transfer"] and not input_audio:
+        if task in ["audio2audio", "continuation", "inpainting", "style_transfer"] and input_audio is None:
             raise ValueError(f"Task '{task}' requires input_audio to be provided")
         
         if task == "inpainting" and inpaint_end_time <= inpaint_start_time:
             raise ValueError("inpaint_end_time must be greater than inpaint_start_time")
         
-        if task == "vocal_accompaniment" and not input_audio:
+        if task == "vocal_accompaniment" and input_audio is None:
             raise ValueError("Task 'vocal_accompaniment' requires input_audio with vocals")
     
-    def _configure_task_parameters(self, task: str, input_audio: Union[File, str], reference_audio: Union[File, str],
+    def _configure_task_parameters(self, task: str, input_audio: File, reference_audio: File,
                                  continuation_mode: str, inpaint_start_time: float, inpaint_end_time: float,
                                  extend_duration: float, style_strength: float, audio2audio_strength: float,
                                  variation_strength: float, generate_accompaniment: bool, 
