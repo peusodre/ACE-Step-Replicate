@@ -28,6 +28,8 @@ build:
     - "huggingface_hub>=0.23.0"
     - "safetensors>=0.4.2"
     - "sentencepiece>=0.1.99"
+    - "typing-extensions>=4.0.0"
+    - "numpy>=1.21.0"
     # Audio processing
     - "librosa==0.11.0"
     - "soundfile==0.13.1"
@@ -44,6 +46,7 @@ build:
     - "py3langid==0.3.0"
     - "hangul-romanize==0.1.0"
     - "num2words==0.5.14"
+    - "pydantic>=2.0.0"
     - "spacy==3.8.4"
     - "cutlet"
     - "fugashi[unidic-lite]"
