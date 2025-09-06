@@ -252,7 +252,10 @@ class Predictor(BasePredictor):
             final_lyrics = style_lyrics if style_lyrics else lyrics
         elif task in ["continuation", "inpainting"]:
             # For continuation and inpainting, use the original prompt or a generic one
-            final_prompt = prompt if prompt else "Continue the music in the same style"
+            if task == "continuation":
+                final_prompt = prompt if prompt else "Continue the music in the same style and mood"
+            else:  # inpainting
+                final_prompt = prompt if prompt else "Edit this section of the music"
             final_lyrics = lyrics if lyrics else ""
         else:
             final_prompt = prompt
@@ -304,6 +307,16 @@ class Predictor(BasePredictor):
                 print(f"DEBUG: Audio duration: {task_params['audio_duration']}")
                 print(f"DEBUG: Prompt: {final_prompt}")
                 print(f"DEBUG: Lyrics: {final_lyrics}")
+                
+                # Check if source audio file exists
+                if task_params.get('src_audio_path'):
+                    import os
+                    if os.path.exists(task_params['src_audio_path']):
+                        print(f"DEBUG: Source audio file exists and is readable")
+                    else:
+                        print(f"DEBUG: ERROR - Source audio file does not exist!")
+                else:
+                    print(f"DEBUG: ERROR - No source audio path provided!")
             
             # Run the ACE-Step pipeline with all parameters
             output_paths = self.pipeline(
@@ -417,8 +430,8 @@ class Predictor(BasePredictor):
                 "task_type": "extend",
                 "src_audio_path": input_audio,
                 "audio_duration": total_duration,  # Total duration including extension
-                "repaint_start": int(audio_duration),  # Start repainting from end of original
-                "repaint_end": int(total_duration),  # Repaint the extension part
+                "repaint_start": int(audio_duration),  # Start from end of original audio
+                "repaint_end": int(total_duration),  # End at total duration (triggers extend)
             })
         
         elif task == "inpainting":
