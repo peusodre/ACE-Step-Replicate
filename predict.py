@@ -285,7 +285,6 @@ class Predictor(BasePredictor):
                 task=task,
                 input_audio=input_audio_path,
                 reference_audio=reference_audio_path,
-                continuation_mode=continuation_mode,
                 inpaint_start_time=inpaint_start_time,
                 inpaint_end_time=inpaint_end_time,
                 extend_duration=extend_duration,
@@ -297,8 +296,8 @@ class Predictor(BasePredictor):
                 audio_duration=audio_duration
             )
             
-            # Debug logging for continuation and inpainting
-            if task in ["continuation", "inpainting"]:
+            # Debug logging for extend and repaint
+            if task in ["extend", "repaint"]:
                 print(f"DEBUG: Task: {task}")
                 print(f"DEBUG: Task type: {task_params['task_type']}")
                 print(f"DEBUG: Source audio: {task_params.get('src_audio_path')}")
@@ -310,7 +309,6 @@ class Predictor(BasePredictor):
                 
                 # Check if source audio file exists
                 if task_params.get('src_audio_path'):
-                    import os
                     if os.path.exists(task_params['src_audio_path']):
                         print(f"DEBUG: Source audio file exists and is readable")
                     else:
