@@ -286,14 +286,6 @@ class Predictor(BasePredictor):
                 audio_duration=audio_duration
             )
             
-            # Debug logging for continuation and inpainting
-            if task in ["continuation", "inpainting"]:
-                print(f"DEBUG: Task: {task}")
-                print(f"DEBUG: Task type: {task_params['task_type']}")
-                print(f"DEBUG: Source audio: {task_params.get('src_audio_path')}")
-                print(f"DEBUG: Repaint start: {task_params.get('repaint_start')}")
-                print(f"DEBUG: Repaint end: {task_params.get('repaint_end')}")
-                print(f"DEBUG: Audio duration: {task_params['audio_duration']}")
             
             # Run the ACE-Step pipeline with all parameters
             output_paths = self.pipeline(
@@ -328,8 +320,6 @@ class Predictor(BasePredictor):
                 repaint_start=task_params.get("repaint_start", 0),
                 repaint_end=task_params.get("repaint_end", 0),
                 
-                # Additional parameters for repaint/extend tasks
-                add_retake_noise=task_params["task_type"] in ["repaint", "extend", "retake"],
                 
                 # Variation and retake parameters
                 retake_seeds=retake_seeds,
@@ -352,7 +342,7 @@ class Predictor(BasePredictor):
                 debug=False,
                 
                 # Additional parameters
-                oss_steps=[],
+                oss_steps=None,
             )
             
             # Return the first audio file (the model returns [audio_path, params_json])
