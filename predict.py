@@ -286,6 +286,15 @@ class Predictor(BasePredictor):
                 audio_duration=audio_duration
             )
             
+            # Debug logging for continuation and inpainting
+            if task in ["continuation", "inpainting"]:
+                print(f"DEBUG: Task: {task}")
+                print(f"DEBUG: Task type: {task_params['task_type']}")
+                print(f"DEBUG: Source audio: {task_params.get('src_audio_path')}")
+                print(f"DEBUG: Repaint start: {task_params.get('repaint_start')}")
+                print(f"DEBUG: Repaint end: {task_params.get('repaint_end')}")
+                print(f"DEBUG: Audio duration: {task_params['audio_duration']}")
+            
             # Run the ACE-Step pipeline with all parameters
             output_paths = self.pipeline(
                 # Basic parameters
@@ -318,6 +327,9 @@ class Predictor(BasePredictor):
                 ref_audio_strength=task_params.get("ref_audio_strength", 0.5),
                 repaint_start=task_params.get("repaint_start", 0),
                 repaint_end=task_params.get("repaint_end", 0),
+                
+                # Additional parameters for repaint/extend tasks
+                add_retake_noise=task_params["task_type"] in ["repaint", "extend", "retake"],
                 
                 # Variation and retake parameters
                 retake_seeds=retake_seeds,
@@ -396,21 +408,12 @@ class Predictor(BasePredictor):
                 "src_audio_path": input_audio,
             })
             
-            if continuation_mode == "extend_start":
-                params.update({
-                    "repaint_start": -extend_duration,
-                    "repaint_end": 0,
-                })
-            elif continuation_mode == "extend_end":
-                params.update({
-                    "repaint_start": 0,
-                    "repaint_end": audio_duration + extend_duration,
-                })
-            elif continuation_mode == "extend_both":
-                params.update({
-                    "repaint_start": -extend_duration / 2,
-                    "repaint_end": audio_duration + extend_duration / 2,
-                })
+            # For extend task, we need to set repaint parameters
+            # The extend task will add audio after the original
+            params.update({
+                "repaint_start": 0,  # Start from beginning of original
+                "repaint_end": extend_duration,  # Extend by this duration
+            })
         
         elif task == "inpainting":
             # Audio inpainting/editing
