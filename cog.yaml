@@ -46,23 +46,20 @@ build:
     - "py3langid==0.3.0"
     - "hangul-romanize==0.1.0"
     - "num2words==0.5.14"
-    - "pydantic==2.5.0"
-    - "thinc>=8.3.4,<8.4.0"
-    - "spacy==3.8.4"
     - "cutlet"
     - "fugashi[unidic-lite]"
     # Training utilities (optional but may be needed)
-    - "pytorch_lightning==2.5.1"
-    - "peft"
-    - "tensorboard"
-    - "tensorboardX"
     # Web interface (may be needed for some components)
     - "gradio"
 
   # Install PyTorch and dependencies
   run:
     - "pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu121 torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0"
-    - "pip install --no-cache-dir pydantic==2.5.0 'thinc>=8.3.4,<8.4.0' spacy==3.8.4"
+    - "pip uninstall -y pydantic thinc spacy || true"
+    - "pip install --no-cache-dir --force-reinstall pydantic==2.5.0"
+    - "pip install --no-cache-dir --force-reinstall 'thinc>=8.3.4,<8.4.0'"
+    - "pip install --no-cache-dir --force-reinstall spacy==3.8.4"
+    - "pip install --no-cache-dir pytorch_lightning==2.5.1 peft tensorboard tensorboardX"
 
 # Predict interface
 predict: "predict.py:Predictor"
