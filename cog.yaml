@@ -56,9 +56,9 @@ build:
   run:
     - "pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu121 torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0"
     - "pip uninstall -y pydantic thinc spacy || true"
-    - "pip install --no-cache-dir --force-reinstall pydantic==2.5.0"
-    - "pip install --no-cache-dir --force-reinstall 'thinc>=8.3.4,<8.4.0'"
-    - "pip install --no-cache-dir --force-reinstall spacy==3.8.4"
+    - "pip install --no-cache-dir --force-reinstall pydantic==1.10.13"
+    - "pip install --no-cache-dir --force-reinstall 'thinc>=8.1.0,<8.2.0'"
+    - "pip install --no-cache-dir --force-reinstall spacy==3.7.2"
     - "pip install --no-cache-dir pytorch_lightning==2.5.1 peft tensorboard tensorboardX"
 
 # Predict interface
