@@ -247,8 +247,16 @@ class Predictor(BasePredictor):
         self._validate_inputs(task, input_audio, reference_audio, inpaint_start_time, inpaint_end_time)
         
         # Set up generation parameters
-        final_prompt = style_prompt if style_prompt and task == "style_transfer" else prompt
-        final_lyrics = style_lyrics if style_lyrics and task == "style_transfer" else lyrics
+        if task == "style_transfer":
+            final_prompt = style_prompt if style_prompt else prompt
+            final_lyrics = style_lyrics if style_lyrics else lyrics
+        elif task in ["continuation", "inpainting"]:
+            # For continuation and inpainting, use the original prompt or a generic one
+            final_prompt = prompt if prompt else "Continue the music in the same style"
+            final_lyrics = lyrics if lyrics else ""
+        else:
+            final_prompt = prompt
+            final_lyrics = lyrics
         
         # Set manual seeds (-1 means random)
         manual_seeds = [seed] if seed != -1 else None
@@ -286,6 +294,16 @@ class Predictor(BasePredictor):
                 audio_duration=audio_duration
             )
             
+            # Debug logging for continuation and inpainting
+            if task in ["continuation", "inpainting"]:
+                print(f"DEBUG: Task: {task}")
+                print(f"DEBUG: Task type: {task_params['task_type']}")
+                print(f"DEBUG: Source audio: {task_params.get('src_audio_path')}")
+                print(f"DEBUG: Repaint start: {task_params.get('repaint_start')}")
+                print(f"DEBUG: Repaint end: {task_params.get('repaint_end')}")
+                print(f"DEBUG: Audio duration: {task_params['audio_duration']}")
+                print(f"DEBUG: Prompt: {final_prompt}")
+                print(f"DEBUG: Lyrics: {final_lyrics}")
             
             # Run the ACE-Step pipeline with all parameters
             output_paths = self.pipeline(
@@ -393,34 +411,27 @@ class Predictor(BasePredictor):
         
         elif task == "continuation":
             # Audio continuation/extension
+            # For extend task, we need to set the total duration to include the extension
+            total_duration = audio_duration + extend_duration
             params.update({
                 "task_type": "extend",
                 "src_audio_path": input_audio,
+                "audio_duration": total_duration,  # Total duration including extension
+                "repaint_start": int(audio_duration),  # Start repainting from end of original
+                "repaint_end": int(total_duration),  # Repaint the extension part
             })
-            
-            if continuation_mode == "extend_start":
-                params.update({
-                    "repaint_start": int(-extend_duration),
-                    "repaint_end": 0,
-                })
-            elif continuation_mode == "extend_end":
-                params.update({
-                    "repaint_start": 0,
-                    "repaint_end": int(audio_duration + extend_duration),
-                })
-            elif continuation_mode == "extend_both":
-                params.update({
-                    "repaint_start": int(-extend_duration / 2),
-                    "repaint_end": int(audio_duration + extend_duration / 2),
-                })
         
         elif task == "inpainting":
             # Audio inpainting/editing
+            # Ensure repaint parameters are within valid range
+            repaint_start = max(0, int(inpaint_start_time))
+            repaint_end = max(repaint_start + 1, int(inpaint_end_time))
+            
             params.update({
                 "task_type": "repaint",
                 "src_audio_path": input_audio,
-                "repaint_start": int(inpaint_start_time),  # Must be int
-                "repaint_end": int(inpaint_end_time),  # Must be int
+                "repaint_start": repaint_start,
+                "repaint_end": repaint_end,
             })
         
         elif task == "style_transfer":
