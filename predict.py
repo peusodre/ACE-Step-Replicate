@@ -346,8 +346,8 @@ class Predictor(BasePredictor):
                 ref_audio_input=task_params.get("ref_audio_input"),
                 audio2audio_enable=task_params.get("audio2audio_enable", False),
                 ref_audio_strength=task_params.get("ref_audio_strength", 0.5),
-                repaint_start=task_params.get("repaint_start", 0),
-                repaint_end=task_params.get("repaint_end", 0),
+                repaint_start=int(task_params.get("repaint_start", 0)),
+                repaint_end=int(task_params.get("repaint_end", 0)),
                 
                 
                 # Variation and retake parameters
@@ -385,10 +385,10 @@ class Predictor(BasePredictor):
                        inpaint_start_time: float, inpaint_end_time: float) -> None:
         """Validate inputs based on the selected task."""
         
-        if task in ["audio2audio", "continuation", "inpainting", "style_transfer"] and not input_audio:
+        if task in ["audio2audio", "extend", "repaint", "continuation", "inpainting", "style_transfer"] and not input_audio:
             raise ValueError(f"Task '{task}' requires input_audio to be provided")
         
-        if task == "inpainting" and inpaint_end_time <= inpaint_start_time:
+        if task in ["repaint", "inpainting"] and inpaint_end_time <= inpaint_start_time:
             raise ValueError("inpaint_end_time must be greater than inpaint_start_time")
         
         if task == "vocal_accompaniment" and not input_audio:
@@ -420,29 +420,22 @@ class Predictor(BasePredictor):
                 "ref_audio_strength": 1.0 - audio2audio_strength,  # ACE-Step uses inverse strength
             })
         
-        elif task == "continuation":
-            # Audio continuation/extension
-            # For extend task, we need to set the total duration to include the extension
-            total_duration = audio_duration + extend_duration
+        elif task == "extend":
+            # Audio extension - match Gradio implementation exactly
             params.update({
                 "task_type": "extend",
                 "src_audio_path": input_audio,
-                "audio_duration": total_duration,  # Total duration including extension
-                "repaint_start": int(audio_duration),  # Start from end of original audio
-                "repaint_end": int(total_duration),  # End at total duration (triggers extend)
+                "repaint_start": int(-extend_duration),  # left_extend_length
+                "repaint_end": int(audio_duration + extend_duration),  # audio_duration + right_extend_length
             })
         
-        elif task == "inpainting":
-            # Audio inpainting/editing
-            # Ensure repaint parameters are within valid range
-            repaint_start = max(0, int(inpaint_start_time))
-            repaint_end = max(repaint_start + 1, int(inpaint_end_time))
-            
+        elif task == "repaint":
+            # Audio repainting - match Gradio implementation exactly
             params.update({
                 "task_type": "repaint",
                 "src_audio_path": input_audio,
-                "repaint_start": repaint_start,
-                "repaint_end": repaint_end,
+                "repaint_start": int(inpaint_start_time),
+                "repaint_end": int(inpaint_end_time),
             })
         
         elif task == "style_transfer":
