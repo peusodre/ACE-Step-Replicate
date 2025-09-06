@@ -287,17 +287,6 @@ class Predictor(BasePredictor):
             )
             
             
-            # Adjust parameters for continuation and inpainting modes
-            if task in ["continuation", "inpainting"]:
-                # These modes work better with lower guidance scale and different scheduler
-                adjusted_guidance_scale = min(guidance_scale, 10.0)  # Cap at 10 for repaint/extend
-                adjusted_scheduler = "euler"  # Use euler for better stability
-                adjusted_cfg_type = "apg"  # Use apg for better results
-            else:
-                adjusted_guidance_scale = guidance_scale
-                adjusted_scheduler = scheduler_type
-                adjusted_cfg_type = cfg_type
-            
             # Run the ACE-Step pipeline with all parameters
             output_paths = self.pipeline(
                 # Basic parameters
@@ -306,9 +295,9 @@ class Predictor(BasePredictor):
                 prompt=final_prompt,
                 lyrics=final_lyrics,
                 infer_step=infer_steps,
-                guidance_scale=adjusted_guidance_scale,
-                scheduler_type=adjusted_scheduler,
-                cfg_type=adjusted_cfg_type,
+                guidance_scale=guidance_scale,
+                scheduler_type=scheduler_type,
+                cfg_type=cfg_type,
                 omega_scale=omega_scale,
                 manual_seeds=manual_seeds,
                 
@@ -353,7 +342,7 @@ class Predictor(BasePredictor):
                 debug=False,
                 
                 # Additional parameters
-                oss_steps=None,
+                oss_steps=[],
             )
             
             # Return the first audio file (the model returns [audio_path, params_json])
@@ -407,9 +396,23 @@ class Predictor(BasePredictor):
             params.update({
                 "task_type": "extend",
                 "src_audio_path": input_audio,
-                "repaint_start": 0,  # Start from beginning
-                "repaint_end": int(extend_duration),  # Extend by this duration (must be int)
             })
+            
+            if continuation_mode == "extend_start":
+                params.update({
+                    "repaint_start": int(-extend_duration),
+                    "repaint_end": 0,
+                })
+            elif continuation_mode == "extend_end":
+                params.update({
+                    "repaint_start": 0,
+                    "repaint_end": int(audio_duration + extend_duration),
+                })
+            elif continuation_mode == "extend_both":
+                params.update({
+                    "repaint_start": int(-extend_duration / 2),
+                    "repaint_end": int(audio_duration + extend_duration / 2),
+                })
         
         elif task == "inpainting":
             # Audio inpainting/editing
