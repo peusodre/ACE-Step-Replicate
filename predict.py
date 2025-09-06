@@ -395,7 +395,7 @@ class Predictor(BasePredictor):
             raise ValueError("Task 'vocal_accompaniment' requires input_audio with vocals")
     
     def _configure_task_parameters(self, task: str, input_audio: str, reference_audio: str,
-                                 continuation_mode: str, inpaint_start_time: float, inpaint_end_time: float,
+                                 inpaint_start_time: float, inpaint_end_time: float,
                                  extend_duration: float, style_strength: float, audio2audio_strength: float,
                                  variation_strength: float, generate_accompaniment: bool, 
                                  accompaniment_style: str, audio_duration: float) -> dict:
