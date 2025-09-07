@@ -269,11 +269,18 @@ class Predictor(BasePredictor):
             # Save File objects to temporary files if provided
             input_audio_path = None
             reference_audio_path = None
+            input_audio_duration = audio_duration  # Default to provided duration
             
             if input_audio:
                 input_audio_path = os.path.join(temp_dir, "input_audio.wav")
                 with open(input_audio_path, "wb") as f:
                     f.write(input_audio.read())
+                
+                # Get actual duration of input audio for continuation/repaint tasks
+                if task in ["extend", "repaint", "continuation", "inpainting"]:
+                    import librosa
+                    input_audio_duration = librosa.get_duration(filename=input_audio_path)
+                    print(f"DEBUG: Input audio duration: {input_audio_duration} seconds")
             
             if reference_audio:
                 reference_audio_path = os.path.join(temp_dir, "reference_audio.wav")
@@ -293,7 +300,7 @@ class Predictor(BasePredictor):
                 variation_strength=variation_strength,
                 generate_accompaniment=generate_accompaniment,
                 accompaniment_style=accompaniment_style,
-                audio_duration=audio_duration
+                audio_duration=input_audio_duration  # Use actual input audio duration
             )
             
             # Debug logging for extend and repaint
@@ -422,11 +429,13 @@ class Predictor(BasePredictor):
         
         elif task == "extend":
             # Audio extension - match Gradio implementation exactly
+            total_duration = audio_duration + extend_duration
             params.update({
                 "task_type": "extend",
                 "src_audio_path": input_audio,
+                "audio_duration": total_duration,  # Total duration including extension
                 "repaint_start": int(-extend_duration),  # left_extend_length
-                "repaint_end": int(audio_duration + extend_duration),  # audio_duration + right_extend_length
+                "repaint_end": int(total_duration),  # audio_duration + right_extend_length
             })
         
         elif task == "repaint":
