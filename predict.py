@@ -243,6 +243,12 @@ class Predictor(BasePredictor):
         # Create a temporary directory for output
         temp_dir = tempfile.mkdtemp()
         
+        # Map old task names to new ones for backward compatibility
+        if task == "continuation":
+            task = "extend"
+        elif task == "inpainting":
+            task = "repaint"
+        
         # Validate and process inputs based on task type
         self._validate_inputs(task, input_audio, reference_audio, inpaint_start_time, inpaint_end_time)
         
@@ -250,11 +256,11 @@ class Predictor(BasePredictor):
         if task == "style_transfer":
             final_prompt = style_prompt if style_prompt else prompt
             final_lyrics = style_lyrics if style_lyrics else lyrics
-        elif task in ["continuation", "inpainting"]:
-            # For continuation and inpainting, use the original prompt or a generic one
-            if task == "continuation":
+        elif task in ["extend", "repaint"]:
+            # For extend and repaint, use the original prompt or a generic one
+            if task == "extend":
                 final_prompt = prompt if prompt else "Continue the music in the same style and mood"
-            else:  # inpainting
+            else:  # repaint
                 final_prompt = prompt if prompt else "Edit this section of the music"
             final_lyrics = lyrics if lyrics else ""
         else:
@@ -276,10 +282,10 @@ class Predictor(BasePredictor):
                 with open(input_audio_path, "wb") as f:
                     f.write(input_audio.read())
                 
-                # Get actual duration of input audio for continuation/repaint tasks
-                if task in ["extend", "repaint", "continuation", "inpainting"]:
+                # Get actual duration of input audio for extend/repaint tasks
+                if task in ["extend", "repaint"]:
                     import librosa
-                    input_audio_duration = librosa.get_duration(filename=input_audio_path)
+                    input_audio_duration = librosa.get_duration(path=input_audio_path)
                     print(f"DEBUG: Input audio duration: {input_audio_duration} seconds")
             
             if reference_audio:
@@ -304,7 +310,7 @@ class Predictor(BasePredictor):
             )
             
             # Debug logging for extend and repaint
-            if task in ["extend", "repaint", "continuation", "inpainting"]:
+            if task in ["extend", "repaint"]:
                 print(f"DEBUG: Task: {task}")
                 print(f"DEBUG: Task type: {task_params['task_type']}")
                 print(f"DEBUG: Source audio: {task_params.get('src_audio_path')}")
