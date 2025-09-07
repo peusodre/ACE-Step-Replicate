@@ -304,7 +304,7 @@ class Predictor(BasePredictor):
             )
             
             # Debug logging for extend and repaint
-            if task in ["extend", "repaint"]:
+            if task in ["extend", "repaint", "continuation", "inpainting"]:
                 print(f"DEBUG: Task: {task}")
                 print(f"DEBUG: Task type: {task_params['task_type']}")
                 print(f"DEBUG: Source audio: {task_params.get('src_audio_path')}")
@@ -440,11 +440,20 @@ class Predictor(BasePredictor):
         
         elif task == "repaint":
             # Audio repainting - match Gradio implementation exactly
+            # Ensure repaint parameters are within valid range
+            repaint_start = max(0, int(inpaint_start_time))
+            repaint_end = min(int(audio_duration), int(inpaint_end_time))
+            
+            # Ensure repaint_end > repaint_start
+            if repaint_end <= repaint_start:
+                repaint_end = repaint_start + 1
+            
             params.update({
                 "task_type": "repaint",
                 "src_audio_path": input_audio,
-                "repaint_start": int(inpaint_start_time),
-                "repaint_end": int(inpaint_end_time),
+                "audio_duration": audio_duration,  # Use actual input audio duration
+                "repaint_start": repaint_start,
+                "repaint_end": repaint_end,
             })
         
         elif task == "style_transfer":
