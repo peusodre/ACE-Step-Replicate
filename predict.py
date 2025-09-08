@@ -304,7 +304,8 @@ class Predictor(BasePredictor):
                 variation_strength=variation_strength,
                 generate_accompaniment=generate_accompaniment,
                 accompaniment_style=accompaniment_style,
-                audio_duration=input_audio_duration  # Use actual input audio duration
+                audio_duration=input_audio_duration,  # Use actual input audio duration
+                continuation_mode=continuation_mode
             )
             
             # Debug logging for extend and repaint
@@ -317,6 +318,7 @@ class Predictor(BasePredictor):
                 print(f"DEBUG: Audio duration: {task_params['audio_duration']}")
                 print(f"DEBUG: Prompt: {final_prompt}")
                 print(f"DEBUG: Lyrics: {final_lyrics}")
+                print(f"DEBUG: Continuation mode: {continuation_mode}")
                 
                 # Check if source audio file exists
                 if task_params.get('src_audio_path'):
@@ -332,6 +334,8 @@ class Predictor(BasePredictor):
                     print(f"DEBUG: Repaint range: {task_params.get('repaint_start')} to {task_params.get('repaint_end')} seconds")
                     print(f"DEBUG: Total audio duration: {task_params['audio_duration']} seconds")
                     print(f"DEBUG: Repaint percentage: {task_params.get('repaint_start')/task_params['audio_duration']*100:.1f}% to {task_params.get('repaint_end')/task_params['audio_duration']*100:.1f}%")
+                    print(f"DEBUG: Inpaint start time: {inpaint_start_time}")
+                    print(f"DEBUG: Inpaint end time: {inpaint_end_time}")
             
             # Run the ACE-Step pipeline with all parameters
             output_paths = self.pipeline(
@@ -415,7 +419,7 @@ class Predictor(BasePredictor):
                                  inpaint_start_time: float, inpaint_end_time: float,
                                  extend_duration: float, style_strength: float, audio2audio_strength: float,
                                  variation_strength: float, generate_accompaniment: bool, 
-                                 accompaniment_style: str, audio_duration: float) -> dict:
+                                 accompaniment_style: str, audio_duration: float, continuation_mode: str) -> dict:
         """Configure task-specific parameters for the pipeline."""
         
         params = {
@@ -438,17 +442,44 @@ class Predictor(BasePredictor):
             })
         
         elif task == "extend":
-            # Audio extension - match Gradio implementation exactly
-            # For extend, we want to extend the audio by the specified duration
-            # The repaint_start should be the original audio duration (where to start repainting)
-            # The repaint_end should be the total duration (where to stop repainting)
+            # Audio extension with different modes
             total_duration = audio_duration + extend_duration
+            transition_overlap = min(3.0, audio_duration * 0.1)  # 3 seconds or 10% of original audio, whichever is smaller
+            
+            if continuation_mode == "extend_start":
+                # Extend from the beginning - repaint the first part
+                repaint_start = 0
+                repaint_end = int(extend_duration + transition_overlap)
+                
+            elif continuation_mode == "extend_end":
+                # Extend from the end - repaint the last part with smooth transition
+                repaint_start = max(0, int(audio_duration - transition_overlap))
+                repaint_end = int(total_duration)
+                
+            elif continuation_mode == "extend_both":
+                # Extend from both sides - repaint both ends
+                repaint_start = 0
+                repaint_end = int(total_duration)
+                
+            elif continuation_mode == "inpaint_middle":
+                # Inpaint the middle section instead of extending
+                middle_start = int(audio_duration * 0.25)  # Start at 25% of original audio
+                middle_end = int(audio_duration * 0.75)   # End at 75% of original audio
+                repaint_start = middle_start
+                repaint_end = middle_end
+                total_duration = audio_duration  # Keep original duration for inpainting
+                
+            else:
+                # Default to extend_end
+                repaint_start = max(0, int(audio_duration - transition_overlap))
+                repaint_end = int(total_duration)
+            
             params.update({
                 "task_type": "extend",
                 "src_audio_path": input_audio,
-                "audio_duration": total_duration,  # Total duration including extension
-                "repaint_start": int(audio_duration),  # Start repainting from end of original audio
-                "repaint_end": int(total_duration),  # Repaint until the end of extended audio
+                "audio_duration": total_duration,
+                "repaint_start": repaint_start,
+                "repaint_end": repaint_end,
             })
         
         elif task == "repaint":
@@ -474,6 +505,8 @@ class Predictor(BasePredictor):
             params.update({
                 "task_type": "edit",
                 "src_audio_path": input_audio,
+                "edit_target_prompt": prompt,  # Use the provided prompt as target
+                "edit_target_lyrics": lyrics,  # Use the provided lyrics as target
                 "edit_n_min": 1.0 - style_strength,  # Higher strength = lower n_min
                 "edit_n_max": 1.0,
                 "edit_n_avg": 1,
@@ -508,3 +541,4 @@ class Predictor(BasePredictor):
                                                                f"{accompaniment_style} accompaniment")
         
         return params
+lly 
