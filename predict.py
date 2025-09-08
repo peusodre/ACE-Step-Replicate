@@ -328,6 +328,12 @@ class Predictor(BasePredictor):
                         print(f"DEBUG: ERROR - Source audio file does not exist!")
                 else:
                     print(f"DEBUG: ERROR - No source audio path provided!")
+                
+                # Additional debug for repaint parameters
+                if task == "repaint":
+                    print(f"DEBUG: Repaint range: {task_params.get('repaint_start')} to {task_params.get('repaint_end')} seconds")
+                    print(f"DEBUG: Total audio duration: {task_params['audio_duration']} seconds")
+                    print(f"DEBUG: Repaint percentage: {task_params.get('repaint_start')/task_params['audio_duration']*100:.1f}% to {task_params.get('repaint_end')/task_params['audio_duration']*100:.1f}%")
             
             # Run the ACE-Step pipeline with all parameters
             output_paths = self.pipeline(
