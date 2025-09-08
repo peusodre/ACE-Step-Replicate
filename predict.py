@@ -4,14 +4,10 @@ Supports full-length songs, lyric alignment, continuation, style transfer, voice
 """
 
 import os
-import sys
 import tempfile
 import torch
-from typing import Optional, List, Union
-from cog import BasePredictor, Input, Path, File
-
-# Add the current directory to the Python path so we can import acestep
-sys.path.insert(0, '/src')
+from typing import Optional, List
+from cog import BasePredictor, Input, Path
 
 from acestep.pipeline_ace_step import ACEStepPipeline
 
@@ -34,12 +30,14 @@ class Predictor(BasePredictor):
         except Exception:
             dtype = "float32"
 
-        # Initialize the ACE-Step pipeline to match Gradio implementation exactly
+        # Initialize the ACE-Step pipeline with optimizations for inference
         self.pipeline = ACEStepPipeline(
             checkpoint_dir=None,  # Will download automatically
+            device_id=0,
             dtype=dtype,
-            persistent_storage_path="/tmp/acestep_cache",  # Match Gradio's persistent storage
-            torch_compile=False,  # Match Gradio's torch_compile setting
+            torch_compile=True,  # Optimize for faster inference
+            cpu_offload=True,    # Enable CPU offloading to manage GPU memory
+            overlapped_decode=True,  # Enable overlapped decoding for efficiency
         )
         
         # Load the model checkpoint
@@ -51,7 +49,7 @@ class Predictor(BasePredictor):
         task: str = Input(
             description="Generation task type",
             default="text2music",
-            choices=["text2music", "audio2audio", "continuation", "inpainting", "style_transfer", "vocal_accompaniment"]
+            choices=["text2music", "audio2audio", "extend", "repaint", "continuation", "inpainting", "style_transfer", "vocal_accompaniment"]
         ),
         prompt: str = Input(
             description="Text prompt describing the music style, genre, or mood",
@@ -69,36 +67,43 @@ class Predictor(BasePredictor):
         ),
         
         # === AUDIO INPUT FOR ADVANCED TASKS ===
-        input_audio: File = Input(
-            description="Input audio file for audio2audio, continuation, inpainting, or style transfer (drag & drop supported)",
+        input_audio: Optional[Path] = Input(
+            description="Input audio file for audio2audio, continuation, inpainting, or style transfer",
             default=None
         ),
-        reference_audio: File = Input(
-            description="Reference audio file for style transfer or voice cloning (drag & drop supported)",
+        reference_audio: Optional[Path] = Input(
+            description="Reference audio for style transfer or voice cloning",
             default=None
         ),
         
-        # === CONTINUATION & INPAINTING ===
-        continuation_mode: str = Input(
-            description="How to continue/extend the input audio",
-            default="extend_end",
-            choices=["extend_start", "extend_end", "extend_both", "inpaint_middle"]
-        ),
+        # === EXTENSION & REPAINTING ===
         inpaint_start_time: float = Input(
-            description="Start time (seconds) for inpainting/editing section",
+            description="Start time (seconds) for repainting/editing section",
             default=0.0,
             ge=0.0
         ),
         inpaint_end_time: float = Input(
-            description="End time (seconds) for inpainting/editing section",
+            description="End time (seconds) for repainting/editing section",
             default=0.0,
             ge=0.0
         ),
+        repaint_strength: float = Input(
+            description="Strength of repaint changes (0.0 = no change, 1.0 = maximum change)",
+            default=0.5,
+            ge=0.0,
+            le=1.0
+        ),
         extend_duration: float = Input(
-            description="Duration (seconds) to extend the audio",
+            description="Duration (seconds) to extend the audio (extends both left and right)",
             default=30.0,
             ge=5.0,
             le=120.0
+        ),
+        extend_strength: float = Input(
+            description="Strength of input audio influence for continuation (0.0 = ignore input, 1.0 = closely follow input style)",
+            default=0.7,
+            ge=0.0,
+            le=1.0
         ),
         
         # === STYLE TRANSFER & REMIX ===
@@ -171,13 +176,13 @@ class Predictor(BasePredictor):
         ),
         
         # === REPRODUCIBILITY & VARIATION ===
-        seed: int = Input(
-            description="Random seed for reproducible generation (-1 for random)",
-            default=-1
+        seed: Optional[int] = Input(
+            description="Random seed for reproducible generation (optional)",
+            default=None
         ),
-        variation_seed: int = Input(
-            description="Seed for variation generation (-1 for random)",
-            default=-1
+        variation_seed: Optional[int] = Input(
+            description="Seed for variation generation (creates slight variations)",
+            default=None
         ),
         variation_strength: float = Input(
             description="Strength of variation (0.0 = no variation, 1.0 = maximum variation)",
@@ -247,50 +252,32 @@ class Predictor(BasePredictor):
         elif task == "inpainting":
             task = "repaint"
         
+        # Save File objects to temporary files if provided
+        input_audio_path = None
+        reference_audio_path = None
+        
+        if input_audio is not None:
+            input_audio_path = os.path.join(temp_dir, "input_audio.wav")
+            with open(input_audio_path, "wb") as f:
+                f.write(input_audio.read())
+        
+        if reference_audio is not None:
+            reference_audio_path = os.path.join(temp_dir, "reference_audio.wav")
+            with open(reference_audio_path, "wb") as f:
+                f.write(reference_audio.read())
+        
         # Validate and process inputs based on task type
-        self._validate_inputs(task, input_audio, reference_audio, inpaint_start_time, inpaint_end_time)
+        self._validate_inputs(task, input_audio_path, reference_audio_path, inpaint_start_time, inpaint_end_time)
         
         # Set up generation parameters
-        if task == "style_transfer":
-            final_prompt = style_prompt if style_prompt else prompt
-            final_lyrics = style_lyrics if style_lyrics else lyrics
-        elif task in ["extend", "repaint"]:
-            # For extend and repaint, use the original prompt or a generic one
-            if task == "extend":
-                final_prompt = prompt if prompt else "Continue the music in the same style and mood"
-            else:  # repaint
-                final_prompt = prompt if prompt else "Edit this section of the music"
-            final_lyrics = lyrics if lyrics else ""
-        else:
-            final_prompt = prompt
-            final_lyrics = lyrics
+        final_prompt = style_prompt if style_prompt and task == "style_transfer" else prompt
+        final_lyrics = style_lyrics if style_lyrics and task == "style_transfer" else lyrics
         
-        # Set manual seeds (-1 means random)
-        manual_seeds = [seed] if seed != -1 else None
-        retake_seeds = [variation_seed] if variation_seed != -1 else manual_seeds
+        # Set manual seeds
+        manual_seeds = [seed] if seed is not None else None
+        retake_seeds = [variation_seed] if variation_seed is not None else manual_seeds
         
         try:
-            # Save File objects to temporary files if provided
-            input_audio_path = None
-            reference_audio_path = None
-            input_audio_duration = audio_duration  # Default to provided duration
-            
-            if input_audio:
-                input_audio_path = os.path.join(temp_dir, "input_audio.wav")
-                with open(input_audio_path, "wb") as f:
-                    f.write(input_audio.read())
-                
-                # Get actual duration of input audio for extend/repaint tasks
-                if task in ["extend", "repaint"]:
-                    import librosa
-                    input_audio_duration = librosa.get_duration(path=input_audio_path)
-                    print(f"DEBUG: Input audio duration: {input_audio_duration} seconds")
-            
-            if reference_audio:
-                reference_audio_path = os.path.join(temp_dir, "reference_audio.wav")
-                with open(reference_audio_path, "wb") as f:
-                    f.write(reference_audio.read())
-            
             # Configure task-specific parameters
             task_params = self._configure_task_parameters(
                 task=task,
@@ -298,44 +285,16 @@ class Predictor(BasePredictor):
                 reference_audio=reference_audio_path,
                 inpaint_start_time=inpaint_start_time,
                 inpaint_end_time=inpaint_end_time,
+                repaint_strength=repaint_strength,
                 extend_duration=extend_duration,
+                extend_strength=extend_strength,
                 style_strength=style_strength,
                 audio2audio_strength=audio2audio_strength,
                 variation_strength=variation_strength,
                 generate_accompaniment=generate_accompaniment,
                 accompaniment_style=accompaniment_style,
-                audio_duration=input_audio_duration,  # Use actual input audio duration
-                continuation_mode=continuation_mode
+                audio_duration=audio_duration
             )
-            
-            # Debug logging for extend and repaint
-            if task in ["extend", "repaint"]:
-                print(f"DEBUG: Task: {task}")
-                print(f"DEBUG: Task type: {task_params['task_type']}")
-                print(f"DEBUG: Source audio: {task_params.get('src_audio_path')}")
-                print(f"DEBUG: Repaint start: {task_params.get('repaint_start')}")
-                print(f"DEBUG: Repaint end: {task_params.get('repaint_end')}")
-                print(f"DEBUG: Audio duration: {task_params['audio_duration']}")
-                print(f"DEBUG: Prompt: {final_prompt}")
-                print(f"DEBUG: Lyrics: {final_lyrics}")
-                print(f"DEBUG: Continuation mode: {continuation_mode}")
-                
-                # Check if source audio file exists
-                if task_params.get('src_audio_path'):
-                    if os.path.exists(task_params['src_audio_path']):
-                        print(f"DEBUG: Source audio file exists and is readable")
-                    else:
-                        print(f"DEBUG: ERROR - Source audio file does not exist!")
-                else:
-                    print(f"DEBUG: ERROR - No source audio path provided!")
-                
-                # Additional debug for repaint parameters
-                if task == "repaint":
-                    print(f"DEBUG: Repaint range: {task_params.get('repaint_start')} to {task_params.get('repaint_end')} seconds")
-                    print(f"DEBUG: Total audio duration: {task_params['audio_duration']} seconds")
-                    print(f"DEBUG: Repaint percentage: {task_params.get('repaint_start')/task_params['audio_duration']*100:.1f}% to {task_params.get('repaint_end')/task_params['audio_duration']*100:.1f}%")
-                    print(f"DEBUG: Inpaint start time: {inpaint_start_time}")
-                    print(f"DEBUG: Inpaint end time: {inpaint_end_time}")
             
             # Run the ACE-Step pipeline with all parameters
             output_paths = self.pipeline(
@@ -367,13 +326,12 @@ class Predictor(BasePredictor):
                 ref_audio_input=task_params.get("ref_audio_input"),
                 audio2audio_enable=task_params.get("audio2audio_enable", False),
                 ref_audio_strength=task_params.get("ref_audio_strength", 0.5),
-                repaint_start=int(task_params.get("repaint_start", 0)),
-                repaint_end=int(task_params.get("repaint_end", 0)),
-                
+                repaint_start=task_params.get("repaint_start", 0),
+                repaint_end=task_params.get("repaint_end", 0),
                 
                 # Variation and retake parameters
                 retake_seeds=retake_seeds,
-                retake_variance=1.0 if task == "extend" else (0.2 if task == "repaint" else variation_strength),
+                retake_variance=task_params.get("retake_variance", variation_strength),
                 
                 # Style transfer parameters (for edit mode)
                 edit_target_prompt=task_params.get("edit_target_prompt"),
@@ -392,7 +350,7 @@ class Predictor(BasePredictor):
                 debug=False,
                 
                 # Additional parameters
-                oss_steps="",
+                oss_steps=[],
             )
             
             # Return the first audio file (the model returns [audio_path, params_json])
@@ -402,28 +360,34 @@ class Predictor(BasePredictor):
         except Exception as e:
             raise RuntimeError(f"Prediction failed for task '{task}': {str(e)}")
     
-    def _validate_inputs(self, task: str, input_audio: str, reference_audio: str, 
-                       inpaint_start_time: float, inpaint_end_time: float) -> None:
+    def _validate_inputs(self, task: str, input_audio: Optional[str], reference_audio: Optional[str], 
+                        inpaint_start_time: float, inpaint_end_time: float) -> None:
         """Validate inputs based on the selected task."""
         
-        if task in ["audio2audio", "extend", "repaint", "continuation", "inpainting", "style_transfer"] and not input_audio:
+        if task in ["audio2audio", "extend", "repaint", "continuation", "inpainting", "style_transfer"] and input_audio is None:
             raise ValueError(f"Task '{task}' requires input_audio to be provided")
         
         if task in ["repaint", "inpainting"] and inpaint_end_time <= inpaint_start_time:
             raise ValueError("inpaint_end_time must be greater than inpaint_start_time")
         
-        if task == "vocal_accompaniment" and not input_audio:
+        if task == "vocal_accompaniment" and input_audio is None:
             raise ValueError("Task 'vocal_accompaniment' requires input_audio with vocals")
     
-    def _configure_task_parameters(self, task: str, input_audio: str, reference_audio: str,
-                                 inpaint_start_time: float, inpaint_end_time: float,
-                                 extend_duration: float, style_strength: float, audio2audio_strength: float,
-                                 variation_strength: float, generate_accompaniment: bool, 
-                                 accompaniment_style: str, audio_duration: float, continuation_mode: str) -> dict:
+    def _configure_task_parameters(self, task: str, input_audio: Optional[str], reference_audio: Optional[str],
+                                 inpaint_start_time: float, inpaint_end_time: float, repaint_strength: float,
+                                 extend_duration: float, extend_strength: float, style_strength: float, 
+                                 audio2audio_strength: float, variation_strength: float, generate_accompaniment: bool, 
+                                 accompaniment_style: str, audio_duration: float) -> dict:
         """Configure task-specific parameters for the pipeline."""
         
+        # Get actual audio duration for tasks that use input audio
+        actual_audio_duration = audio_duration  # Default to provided duration
+        if input_audio and task in ["extend", "repaint", "style_transfer", "vocal_accompaniment"]:
+            import librosa
+            actual_audio_duration = librosa.get_duration(filename=input_audio)
+        
         params = {
-            "audio_duration": audio_duration,
+            "audio_duration": actual_audio_duration,
             "task_type": "text2music",  # Default ACE-Step task type
         }
         
@@ -442,74 +406,41 @@ class Predictor(BasePredictor):
             })
         
         elif task == "extend":
-            # Audio extension with different modes
-            total_duration = audio_duration + extend_duration
-            transition_overlap = min(3.0, audio_duration * 0.1)  # 3 seconds or 10% of original audio, whichever is smaller
-            
-            if continuation_mode == "extend_start":
-                # Extend from the beginning - repaint the first part
-                repaint_start = 0
-                repaint_end = int(extend_duration + transition_overlap)
-                
-            elif continuation_mode == "extend_end":
-                # Extend from the end - repaint the last part with smooth transition
-                repaint_start = max(0, int(audio_duration - transition_overlap))
-                repaint_end = int(total_duration)
-                
-            elif continuation_mode == "extend_both":
-                # Extend from both sides - repaint both ends
-                repaint_start = 0
-                repaint_end = int(total_duration)
-                
-            elif continuation_mode == "inpaint_middle":
-                # Inpaint the middle section instead of extending
-                middle_start = int(audio_duration * 0.25)  # Start at 25% of original audio
-                middle_end = int(audio_duration * 0.75)   # End at 75% of original audio
-                repaint_start = middle_start
-                repaint_end = middle_end
-                total_duration = audio_duration  # Keep original duration for inpainting
-                
-            else:
-                # Default to extend_end
-                repaint_start = max(0, int(audio_duration - transition_overlap))
-                repaint_end = int(total_duration)
-            
+            # Audio extension - match Gradio implementation exactly
             params.update({
                 "task_type": "extend",
                 "src_audio_path": input_audio,
-                "audio_duration": total_duration,
-                "repaint_start": repaint_start,
-                "repaint_end": repaint_end,
+                "repaint_start": -extend_duration,  # left_extend_length
+                "repaint_end": actual_audio_duration + extend_duration,  # actual_audio_duration + right_extend_length
+                "audio_duration": actual_audio_duration + 2 * extend_duration,  # Total output duration
+                # Enable audio2audio to condition generation on input audio style
+                "audio2audio_enable": True,
+                "ref_audio_input": input_audio,
+                "ref_audio_strength": extend_strength,  # User-controlled influence from input audio
             })
         
         elif task == "repaint":
             # Audio repainting - match Gradio implementation exactly
-            # Ensure repaint parameters are within valid range
-            repaint_start = max(0, int(inpaint_start_time))
-            repaint_end = min(int(audio_duration), int(inpaint_end_time))
-            
-            # Ensure repaint_end > repaint_start
-            if repaint_end <= repaint_start:
-                repaint_end = repaint_start + 1
-            
             params.update({
                 "task_type": "repaint",
                 "src_audio_path": input_audio,
-                "audio_duration": audio_duration,  # Use actual input audio duration
-                "repaint_start": repaint_start,
-                "repaint_end": repaint_end,
+                "repaint_start": inpaint_start_time,
+                "repaint_end": inpaint_end_time,
+                "audio_duration": actual_audio_duration,  # Use actual audio duration
             })
+            # Set retake_variance based on repaint_strength for repaint tasks
+            # This overrides the variation_strength parameter for repaint
+            params["retake_variance"] = repaint_strength
         
         elif task == "style_transfer":
             # Style transfer using edit mode
             params.update({
                 "task_type": "edit",
                 "src_audio_path": input_audio,
-                "edit_target_prompt": prompt,  # Use the provided prompt as target
-                "edit_target_lyrics": lyrics,  # Use the provided lyrics as target
                 "edit_n_min": 1.0 - style_strength,  # Higher strength = lower n_min
                 "edit_n_max": 1.0,
                 "edit_n_avg": 1,
+                "audio_duration": actual_audio_duration,  # Use actual audio duration
             })
             
             if reference_audio:
@@ -523,6 +454,7 @@ class Predictor(BasePredictor):
             params.update({
                 "task_type": "text2music",
                 "src_audio_path": input_audio,
+                "audio_duration": actual_audio_duration,  # Use actual audio duration
             })
             
             # Adjust prompt for accompaniment generation
@@ -540,4 +472,4 @@ class Predictor(BasePredictor):
                 params["edit_target_prompt"] = style_mapping.get(accompaniment_style, 
                                                                f"{accompaniment_style} accompaniment")
         
-        return params 
+        return params
