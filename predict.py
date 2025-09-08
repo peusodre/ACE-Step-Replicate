@@ -439,13 +439,16 @@ class Predictor(BasePredictor):
         
         elif task == "extend":
             # Audio extension - match Gradio implementation exactly
+            # For extend, we want to extend the audio by the specified duration
+            # The repaint_start should be the original audio duration (where to start repainting)
+            # The repaint_end should be the total duration (where to stop repainting)
             total_duration = audio_duration + extend_duration
             params.update({
                 "task_type": "extend",
                 "src_audio_path": input_audio,
                 "audio_duration": total_duration,  # Total duration including extension
-                "repaint_start": int(-extend_duration),  # left_extend_length
-                "repaint_end": int(total_duration),  # audio_duration + right_extend_length
+                "repaint_start": int(audio_duration),  # Start repainting from end of original audio
+                "repaint_end": int(total_duration),  # Repaint until the end of extended audio
             })
         
         elif task == "repaint":
