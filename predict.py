@@ -34,14 +34,12 @@ class Predictor(BasePredictor):
         except Exception:
             dtype = "float32"
 
-        # Initialize the ACE-Step pipeline with optimizations for inference
+        # Initialize the ACE-Step pipeline to match Gradio implementation exactly
         self.pipeline = ACEStepPipeline(
             checkpoint_dir=None,  # Will download automatically
-            device_id=0,
             dtype=dtype,
-            torch_compile=True,  # Optimize for faster inference
-            cpu_offload=True,    # Enable CPU offloading to manage GPU memory
-            overlapped_decode=True,  # Enable overlapped decoding for efficiency
+            persistent_storage_path="/tmp/acestep_cache",  # Match Gradio's persistent storage
+            torch_compile=False,  # Match Gradio's torch_compile setting
         )
         
         # Load the model checkpoint
@@ -371,7 +369,7 @@ class Predictor(BasePredictor):
                 
                 # Variation and retake parameters
                 retake_seeds=retake_seeds,
-                retake_variance=variation_strength,
+                retake_variance=1.0 if task == "extend" else (0.2 if task == "repaint" else variation_strength),
                 
                 # Style transfer parameters (for edit mode)
                 edit_target_prompt=task_params.get("edit_target_prompt"),
@@ -390,7 +388,7 @@ class Predictor(BasePredictor):
                 debug=False,
                 
                 # Additional parameters
-                oss_steps=[],
+                oss_steps="",
             )
             
             # Return the first audio file (the model returns [audio_path, params_json])
