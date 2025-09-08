@@ -540,5 +540,4 @@ class Predictor(BasePredictor):
                 params["edit_target_prompt"] = style_mapping.get(accompaniment_style, 
                                                                f"{accompaniment_style} accompaniment")
         
-        return params
-lly 
+        return params 
