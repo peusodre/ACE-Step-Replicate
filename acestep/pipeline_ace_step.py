@@ -1341,7 +1341,7 @@ class ACEStepPipeline:
                 )
             if to_left_pad_gt_latents is not None:
                 target_latents = torch.cat(
-                    [to_right_pad_gt_latents, target_latents], dim=0
+                    [to_left_pad_gt_latents, target_latents], dim=-1
                 )
         return target_latents
 

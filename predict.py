@@ -339,8 +339,11 @@ class Predictor(BasePredictor):
             "repaint_start": task_kwargs.get("repaint_start", 0.0),
             "repaint_end": task_kwargs.get("repaint_end", 0.0),
 
-            "audio2audio_enable": (task in ("audio2audio", "extend")),
-            "ref_audio_input": input_audio_path if task in ("audio2audio", "extend", "style_transfer") else None,
+            "audio2audio_enable": (task == "audio2audio"),
+            "ref_audio_input": (
+                reference_audio_path if canonical_task == "edit" and reference_audio_path else
+                (input_audio_path if task == "audio2audio" else None)
+            ),
             "ref_audio_strength": (
                 float(1.0 - audio2audio_strength) if task == "audio2audio"
                 else float(extend_strength) if task == "extend"
@@ -351,6 +354,7 @@ class Predictor(BasePredictor):
             "retake_seeds": retake_seeds,
             "retake_variance": (
                 float(repaint_strength) if canonical_task == "repaint"
+                else 1e-6 if canonical_task == "extend"  # For extend, use tiny epsilon to preserve center
                 else float(variation_strength)
             ),
 
