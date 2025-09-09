@@ -67,11 +67,11 @@ class Predictor(BasePredictor):
         ),
         
         # === AUDIO INPUT FOR ADVANCED TASKS ===
-        input_audio: Optional[Path] = Input(
+        input_audio: Path = Input(
             description="Input audio file for audio2audio, continuation, inpainting, or style transfer",
             default=None
         ),
-        reference_audio: Optional[Path] = Input(
+        reference_audio: Path = Input(
             description="Reference audio for style transfer or voice cloning",
             default=None
         ),
@@ -360,7 +360,7 @@ class Predictor(BasePredictor):
         except Exception as e:
             raise RuntimeError(f"Prediction failed for task '{task}': {str(e)}")
     
-    def _validate_inputs(self, task: str, input_audio: Optional[str], reference_audio: Optional[str], 
+    def _validate_inputs(self, task: str, input_audio: Optional[Path], reference_audio: Optional[Path], 
                         inpaint_start_time: float, inpaint_end_time: float) -> None:
         """Validate inputs based on the selected task."""
         
@@ -373,7 +373,7 @@ class Predictor(BasePredictor):
         if task == "vocal_accompaniment" and input_audio is None:
             raise ValueError("Task 'vocal_accompaniment' requires input_audio with vocals")
     
-    def _configure_task_parameters(self, task: str, input_audio: Optional[str], reference_audio: Optional[str],
+    def _configure_task_parameters(self, task: str, input_audio: Optional[Path], reference_audio: Optional[Path],
                                  inpaint_start_time: float, inpaint_end_time: float, repaint_strength: float,
                                  extend_duration: float, extend_strength: float, style_strength: float, 
                                  audio2audio_strength: float, variation_strength: float, generate_accompaniment: bool, 
@@ -384,7 +384,9 @@ class Predictor(BasePredictor):
         actual_audio_duration = audio_duration  # Default to provided duration
         if input_audio and task in ["extend", "repaint", "style_transfer", "vocal_accompaniment"]:
             import librosa
-            actual_audio_duration = librosa.get_duration(filename=input_audio)
+            # Convert Path to string for librosa
+            audio_file_path = str(input_audio) if hasattr(input_audio, '__fspath__') else input_audio
+            actual_audio_duration = librosa.get_duration(filename=audio_file_path)
         
         params = {
             "audio_duration": actual_audio_duration,
