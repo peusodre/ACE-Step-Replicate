@@ -1056,6 +1056,21 @@ class ACEStepPipeline:
             logger.info(
                 f"audio2audio_enable: {audio2audio_enable}, ref_latents: {ref_latents.shape}"
             )
+            
+            # Ensure ref_latents matches the (possibly extended) target length
+            target_len = target_latents.shape[-1]
+            ref_len = ref_latents.shape[-1]
+            if ref_len != target_len:
+                if ref_len < target_len:
+                    # pad zeros at the END to reach target length
+                    pad = target_len - ref_len
+                    ref_latents = torch.nn.functional.pad(ref_latents, (0, pad), mode="constant", value=0)
+                else:
+                    # rare case: trim if ref is somehow longer
+                    ref_latents = ref_latents[..., :target_len]
+                logger.info(f"Aligned ref_latents shape: {ref_latents.shape} to match target_latents: {target_latents.shape}")
+            
+            # now shapes match → safe to mix
             target_latents, timesteps, scheduler, num_inference_steps = self.add_latents_noise(
                 gt_latents=ref_latents,
                 sigma_max=(1-ref_audio_strength),
