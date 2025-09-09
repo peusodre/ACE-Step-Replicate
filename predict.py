@@ -319,62 +319,52 @@ class Predictor(BasePredictor):
             print(f"DEBUG: About to call pipeline with src_audio_path: {src_audio_path_value}")
             print(f"DEBUG: Type of src_audio_path: {type(src_audio_path_value)}")
             
+            # Debug: Print all pipeline parameters
+            pipeline_params = {
+                "format": output_format,
+                "audio_duration": task_params["audio_duration"],
+                "prompt": final_prompt,
+                "lyrics": final_lyrics,
+                "infer_step": infer_steps,
+                "guidance_scale": guidance_scale,
+                "scheduler_type": scheduler_type,
+                "cfg_type": cfg_type,
+                "omega_scale": omega_scale,
+                "manual_seeds": manual_seeds,
+                "guidance_interval": 0.5,
+                "guidance_interval_decay": 0.0,
+                "min_guidance_scale": 3.0,
+                "use_erg_tag": use_erg_tag,
+                "use_erg_lyric": use_erg_lyric,
+                "use_erg_diffusion": use_erg_diffusion,
+                "guidance_scale_text": guidance_scale_text,
+                "guidance_scale_lyric": guidance_scale_lyric,
+                "task": task_params["task_type"],
+                "src_audio_path": src_audio_path_value,
+                "ref_audio_input": task_params.get("ref_audio_input"),
+                "audio2audio_enable": task_params.get("audio2audio_enable", False),
+                "ref_audio_strength": task_params.get("ref_audio_strength", 0.5),
+                "repaint_start": task_params.get("repaint_start", 0),
+                "repaint_end": task_params.get("repaint_end", 0),
+                "retake_seeds": retake_seeds,
+                "retake_variance": task_params.get("retake_variance", variation_strength),
+                "edit_target_prompt": task_params.get("edit_target_prompt"),
+                "edit_target_lyrics": task_params.get("edit_target_lyrics"),
+                "edit_n_min": task_params.get("edit_n_min", 0.0),
+                "edit_n_max": task_params.get("edit_n_max", 1.0),
+                "edit_n_avg": task_params.get("edit_n_avg", 1),
+                "lora_name_or_path": lora_name_or_path,
+                "lora_weight": lora_weight,
+                "save_path": temp_dir,
+                "batch_size": 1,
+                "debug": False,
+                "oss_steps": [],
+            }
+            print(f"DEBUG: Pipeline params src_audio_path: {pipeline_params['src_audio_path']}")
+            print(f"DEBUG: Pipeline params task: {pipeline_params['task']}")
+            
             # Run the ACE-Step pipeline with all parameters
-            output_paths = self.pipeline(
-                # Basic parameters
-                format=output_format,
-                audio_duration=task_params["audio_duration"],
-                prompt=final_prompt,
-                lyrics=final_lyrics,
-                infer_step=infer_steps,
-                guidance_scale=guidance_scale,
-                scheduler_type=scheduler_type,
-                cfg_type=cfg_type,
-                omega_scale=omega_scale,
-                manual_seeds=manual_seeds,
-                
-                # Advanced guidance parameters
-                guidance_interval=0.5,
-                guidance_interval_decay=0.0,
-                min_guidance_scale=3.0,
-                use_erg_tag=use_erg_tag,
-                use_erg_lyric=use_erg_lyric,
-                use_erg_diffusion=use_erg_diffusion,
-                guidance_scale_text=guidance_scale_text,
-                guidance_scale_lyric=guidance_scale_lyric,
-                
-                # Task-specific parameters
-                task=task_params["task_type"],
-                src_audio_path=src_audio_path_value,  # Use the debug variable
-                ref_audio_input=task_params.get("ref_audio_input"),
-                audio2audio_enable=task_params.get("audio2audio_enable", False),
-                ref_audio_strength=task_params.get("ref_audio_strength", 0.5),
-                repaint_start=task_params.get("repaint_start", 0),
-                repaint_end=task_params.get("repaint_end", 0),
-                
-                # Variation and retake parameters
-                retake_seeds=retake_seeds,
-                retake_variance=task_params.get("retake_variance", variation_strength),
-                
-                # Style transfer parameters (for edit mode)
-                edit_target_prompt=task_params.get("edit_target_prompt"),
-                edit_target_lyrics=task_params.get("edit_target_lyrics"),
-                edit_n_min=task_params.get("edit_n_min", 0.0),
-                edit_n_max=task_params.get("edit_n_max", 1.0),
-                edit_n_avg=task_params.get("edit_n_avg", 1),
-                
-                # Model customization
-                lora_name_or_path=lora_name_or_path,
-                lora_weight=lora_weight,
-                
-                # Output settings
-                save_path=temp_dir,
-                batch_size=1,
-                debug=False,
-                
-                # Additional parameters
-                oss_steps=[],
-            )
+            output_paths = self.pipeline(**pipeline_params)
             
             # Return the first audio file (the model returns [audio_path, params_json])
             audio_path = output_paths[0]
