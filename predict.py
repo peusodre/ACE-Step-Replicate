@@ -309,6 +309,11 @@ class Predictor(BasePredictor):
                 reference_audio_path=reference_audio_path
             )
             
+            # Debug: Print task_params to see what's in it
+            print(f"DEBUG: task_params keys: {list(task_params.keys())}")
+            print(f"DEBUG: task_params['src_audio_path']: {task_params.get('src_audio_path')}")
+            print(f"DEBUG: task_params.get('src_audio_path'): {task_params.get('src_audio_path')}")
+            
             # Run the ACE-Step pipeline with all parameters
             output_paths = self.pipeline(
                 # Basic parameters
@@ -436,6 +441,10 @@ class Predictor(BasePredictor):
                 "ref_audio_strength": extend_strength,  # User-controlled influence from input audio
             })
             print(f"DEBUG: extend task - params['src_audio_path']: {params.get('src_audio_path')}")
+        
+        # Debug: Print final params before returning
+        print(f"DEBUG: Final params keys: {list(params.keys())}")
+        print(f"DEBUG: Final params['src_audio_path']: {params.get('src_audio_path')}")
         
         elif task == "repaint":
             # Audio repainting - match Gradio implementation exactly
