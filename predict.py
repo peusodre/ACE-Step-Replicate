@@ -176,11 +176,11 @@ class Predictor(BasePredictor):
         ),
         
         # === REPRODUCIBILITY & VARIATION ===
-        seed: Optional[int] = Input(
+        seed: int = Input(
             description="Random seed for reproducible generation (optional)",
             default=None
         ),
-        variation_seed: Optional[int] = Input(
+        variation_seed: int = Input(
             description="Seed for variation generation (creates slight variations)",
             default=None
         ),
