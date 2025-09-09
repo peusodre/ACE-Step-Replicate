@@ -1473,7 +1473,9 @@ class ACEStepPipeline:
 
         start_time = time.time()
 
-        if audio2audio_enable and ref_audio_input is not None:
+        # Only flip to audio2audio when we're doing plain text2music.
+        # For repaint/extend we want to KEEP the task and merely use ref conditioning.
+        if audio2audio_enable and ref_audio_input is not None and task == "text2music":
             task = "audio2audio"
 
         if not self.loaded:

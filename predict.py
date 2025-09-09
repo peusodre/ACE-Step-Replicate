@@ -292,12 +292,20 @@ class Predictor(BasePredictor):
         }
 
         if canonical_task == "extend":
+            # Right-append only: repaint from end -> end + extend_duration
+            # No negative start => no lead-in noise.
+            # We also bias the new tail toward the source with audio2audio conditioning.
             task_kwargs.update({
-                "src_audio_path": input_audio_path,
-                "repaint_start": -float(extend_duration),
-                "repaint_end": actual_audio_duration + float(extend_duration),
+                "task": "repaint",                          # pipeline expects 'task', not 'task_type'
+                "src_audio_path": input_audio_path,         # required for repaint/edit/extend
+                "repaint_start": actual_audio_duration,     # start repaint at the end of the source (seconds)
+                "repaint_end": actual_audio_duration + float(extend_duration),  # append N seconds to the right
+                "audio2audio_enable": True,                 # use source as reference for continuity
+                "ref_audio_input": input_audio_path,
+                "ref_audio_strength": float(extend_strength),  # 0..1; higher = closer to source
+                "retake_variance": 1e-6,                    # keep the existing region effectively frozen
             })
-            audio_duration_out = actual_audio_duration + 2.0 * float(extend_duration)
+            audio_duration_out = actual_audio_duration + float(extend_duration)
         elif canonical_task == "repaint":
             task_kwargs.update({
                 "src_audio_path": input_audio_path,
@@ -334,29 +342,29 @@ class Predictor(BasePredictor):
             "guidance_scale_text": float(guidance_scale_text),
             "guidance_scale_lyric": float(guidance_scale_lyric),
 
-            "task": task_kwargs["task"],
+            "task": task_kwargs.get("task", task),
             "src_audio_path": task_kwargs.get("src_audio_path"),
             "repaint_start": task_kwargs.get("repaint_start", 0.0),
             "repaint_end": task_kwargs.get("repaint_end", 0.0),
 
-            "audio2audio_enable": (task == "audio2audio"),
-            "ref_audio_input": (
+            "audio2audio_enable": task_kwargs.get("audio2audio_enable", (task == "audio2audio")),
+            "ref_audio_input": task_kwargs.get("ref_audio_input", (
                 reference_audio_path if canonical_task == "edit" and reference_audio_path else
                 (input_audio_path if task == "audio2audio" else None)
-            ),
-            "ref_audio_strength": (
+            )),
+            "ref_audio_strength": task_kwargs.get("ref_audio_strength", (
                 float(1.0 - audio2audio_strength) if task == "audio2audio"
                 else float(extend_strength) if task == "extend"
                 else 0.3 if task == "style_transfer" and reference_audio_path
                 else 0.5
-            ),
+            )),
 
             "retake_seeds": retake_seeds,
-            "retake_variance": (
+            "retake_variance": task_kwargs.get("retake_variance", (
                 float(repaint_strength) if canonical_task == "repaint"
                 else 1e-6 if canonical_task == "extend"  # For extend, use tiny epsilon to preserve center
                 else float(variation_strength)
-            ),
+            )),
 
             "lora_name_or_path": lora_name_or_path,
             "lora_weight": float(lora_weight),
