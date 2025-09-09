@@ -314,6 +314,11 @@ class Predictor(BasePredictor):
             print(f"DEBUG: task_params['src_audio_path']: {task_params.get('src_audio_path')}")
             print(f"DEBUG: task_params.get('src_audio_path'): {task_params.get('src_audio_path')}")
             
+            # Debug: Print the actual src_audio_path value being passed to pipeline
+            src_audio_path_value = task_params.get("src_audio_path")
+            print(f"DEBUG: About to call pipeline with src_audio_path: {src_audio_path_value}")
+            print(f"DEBUG: Type of src_audio_path: {type(src_audio_path_value)}")
+            
             # Run the ACE-Step pipeline with all parameters
             output_paths = self.pipeline(
                 # Basic parameters
@@ -340,7 +345,7 @@ class Predictor(BasePredictor):
                 
                 # Task-specific parameters
                 task=task_params["task_type"],
-                src_audio_path=task_params.get("src_audio_path"),
+                src_audio_path=src_audio_path_value,  # Use the debug variable
                 ref_audio_input=task_params.get("ref_audio_input"),
                 audio2audio_enable=task_params.get("audio2audio_enable", False),
                 ref_audio_strength=task_params.get("ref_audio_strength", 0.5),
