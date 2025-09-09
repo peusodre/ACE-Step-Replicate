@@ -339,7 +339,9 @@ class Predictor(BasePredictor):
                 "use_erg_diffusion": use_erg_diffusion,
                 "guidance_scale_text": guidance_scale_text,
                 "guidance_scale_lyric": guidance_scale_lyric,
+                # Add BOTH task and task_type for compatibility
                 "task": task_params["task_type"],
+                "task_type": task_params["task_type"],
                 "src_audio_path": src_audio_path_value,
                 "ref_audio_input": task_params.get("ref_audio_input"),
                 "audio2audio_enable": task_params.get("audio2audio_enable", False),
@@ -362,6 +364,15 @@ class Predictor(BasePredictor):
             }
             print(f"DEBUG: Pipeline params src_audio_path: {pipeline_params['src_audio_path']}")
             print(f"DEBUG: Pipeline params task: {pipeline_params['task']}")
+            print(f"DEBUG: Pipeline params task_type: {pipeline_params['task_type']}")
+            
+            # Add src_audio alias for compatibility
+            pipeline_params["src_audio"] = pipeline_params["src_audio_path"]
+            
+            # Check if the source audio file exists
+            if src_audio_path_value:
+                import os
+                print(f"DEBUG: os.path.exists(src_audio_path): {os.path.exists(src_audio_path_value)}")
             
             # Run the ACE-Step pipeline with all parameters
             output_paths = self.pipeline(**pipeline_params)
@@ -396,11 +407,10 @@ class Predictor(BasePredictor):
         
         # Get actual audio duration for tasks that use input audio
         actual_audio_duration = audio_duration  # Default to provided duration
-        if input_audio and task in ["extend", "repaint", "style_transfer", "vocal_accompaniment"]:
+        if input_audio_path and task in ["extend", "repaint", "style_transfer", "vocal_accompaniment"]:
             import librosa
-            # Convert Path to string for librosa
-            audio_file_path = str(input_audio) if hasattr(input_audio, '__fspath__') else input_audio
-            actual_audio_duration = librosa.get_duration(path=audio_file_path)
+            # Use the same path that will be passed to the pipeline
+            actual_audio_duration = librosa.get_duration(path=input_audio_path)
         
         params = {
             "audio_duration": actual_audio_duration,
