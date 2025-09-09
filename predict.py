@@ -9,6 +9,7 @@ Also supports: text2music, audio2audio, style_transfer (maps to 'edit')
 import os
 import tempfile
 import torch
+import inspect
 from typing import Optional
 from cog import BasePredictor, Input, Path
 
@@ -50,7 +51,7 @@ class Predictor(BasePredictor):
         try:
             if torch.backends.mps.is_available():
                 dtype = "float32"
-            elif torch.cuda.is_available() and not torch.is_bf16_supported():
+            elif torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
                 dtype = "float32"
             elif not torch.cuda.is_available():
                 dtype = "float32"
@@ -212,7 +213,7 @@ class Predictor(BasePredictor):
         }
 
         if canonical_task == "extend":
-            # Extend both sides; bias with ref_audio_input
+            # Extend both sides
             task_kwargs.update({
                 "src_audio_path": input_audio_path,
                 "repaint_start": -float(extend_duration),
@@ -236,7 +237,7 @@ class Predictor(BasePredictor):
             # text2music / audio2audio
             audio_duration_out = audio_duration
 
-        # Minimal, consistent pipeline kwargs
+        # Minimal, consistent pipeline kwargs (intentionally no 'task_type')
         pipeline_params = {
             "format": output_format,
             "audio_duration": audio_duration_out,
@@ -257,9 +258,8 @@ class Predictor(BasePredictor):
             "guidance_scale_text": float(guidance_scale_text),
             "guidance_scale_lyric": float(guidance_scale_lyric),
 
-            # Canonical task & (compat alias) task_type — ONLY intentional duplication
+            # ✅ Only `task`
             "task": task_kwargs["task"],
-            "task_type": task_kwargs["task"],
 
             # Source region args (no-op if not used by the task)
             "src_audio_path": task_kwargs.get("src_audio_path"),
@@ -296,8 +296,16 @@ class Predictor(BasePredictor):
         if pipeline_params["src_audio_path"]:
             print("DEBUG exists(src_audio_path):", os.path.exists(pipeline_params["src_audio_path"]))
 
+        # ---- Prune kwargs to EXACT signature of ACEStepPipeline.__call__ ----
         try:
-            output_paths = self.pipeline(**pipeline_params)
+            call_sig = inspect.signature(self.pipeline.__call__)
+            accepted = set(call_sig.parameters.keys())
+            filtered_params = {k: v for k, v in pipeline_params.items() if k in accepted}
+            if len(filtered_params) != len(pipeline_params):
+                dropped = sorted(set(pipeline_params.keys()) - set(filtered_params.keys()))
+                print("DEBUG dropped kwargs (not in __call__ signature):", dropped)
+
+            output_paths = self.pipeline(**filtered_params)
             return Path(output_paths[0])  # [audio_path, params_json]
         except Exception as e:
             raise RuntimeError(f"Prediction failed for task '{task}': {e}")
