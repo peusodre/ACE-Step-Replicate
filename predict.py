@@ -271,6 +271,15 @@ class Predictor(BasePredictor):
         # Validate and process inputs based on task type
         self._validate_inputs(task, input_audio_path, reference_audio_path, inpaint_start_time, inpaint_end_time)
         
+        # Debug: Print values to understand what's happening
+        print(f"DEBUG: Task: {task}")
+        print(f"DEBUG: input_audio: {input_audio}")
+        print(f"DEBUG: input_audio_path: {input_audio_path}")
+        
+        # Ensure input_audio_path is set for tasks that require it
+        if task in ["extend", "repaint", "style_transfer", "vocal_accompaniment"] and input_audio_path is None:
+            raise ValueError(f"Task '{task}' requires input_audio to be provided")
+        
         # Set up generation parameters
         final_prompt = style_prompt if style_prompt and task == "style_transfer" else prompt
         final_lyrics = style_lyrics if style_lyrics and task == "style_transfer" else lyrics
@@ -414,6 +423,7 @@ class Predictor(BasePredictor):
         
         elif task == "extend":
             # Audio extension - match Gradio implementation exactly
+            print(f"DEBUG: extend task - input_audio_path: {input_audio_path}")
             params.update({
                 "task_type": "extend",
                 "src_audio_path": input_audio_path,  # Use the temporary file path, not the Path object
@@ -425,6 +435,7 @@ class Predictor(BasePredictor):
                 "ref_audio_input": input_audio_path,  # Use the temporary file path
                 "ref_audio_strength": extend_strength,  # User-controlled influence from input audio
             })
+            print(f"DEBUG: extend task - params['src_audio_path']: {params.get('src_audio_path')}")
         
         elif task == "repaint":
             # Audio repainting - match Gradio implementation exactly
