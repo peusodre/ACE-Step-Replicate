@@ -442,10 +442,6 @@ class Predictor(BasePredictor):
             })
             print(f"DEBUG: extend task - params['src_audio_path']: {params.get('src_audio_path')}")
         
-        # Debug: Print final params before returning
-        print(f"DEBUG: Final params keys: {list(params.keys())}")
-        print(f"DEBUG: Final params['src_audio_path']: {params.get('src_audio_path')}")
-        
         elif task == "repaint":
             # Audio repainting - match Gradio implementation exactly
             params.update({
@@ -498,5 +494,9 @@ class Predictor(BasePredictor):
                 # Override with specific accompaniment style
                 params["edit_target_prompt"] = style_mapping.get(accompaniment_style, 
                                                                f"{accompaniment_style} accompaniment")
+        
+        # Debug: Print final params before returning
+        print(f"DEBUG: Final params keys: {list(params.keys())}")
+        print(f"DEBUG: Final params['src_audio_path']: {params.get('src_audio_path')}")
         
         return params
