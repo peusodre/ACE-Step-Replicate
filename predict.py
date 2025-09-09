@@ -190,7 +190,7 @@ class Predictor(BasePredictor):
         ),
         repaint_strength: float = Input(
             description="How strongly to change the repainted region (0..1)",
-            default=0.5, ge=0.0, le=1.0,
+            default=0.7, ge=0.0, le=1.0,
         ),
         extend_duration: float = Input(
             description="Seconds to extend on both sides [extend only]",
@@ -218,12 +218,12 @@ class Predictor(BasePredictor):
         # ---- Audio2Audio -----------------------------------------------------
         audio2audio_strength: float = Input(
             description="Audio2Audio generation strength (0..1). Higher = more change.",
-            default=0.5, ge=0.0, le=1.0,
+            default=0.85, ge=0.0, le=1.0,
         ),
 
         # ---- Diffusion / guidance --------------------------------------------
-        infer_steps: int = Input(default=60, ge=20, le=100),
-        guidance_scale: float = Input(default=15.0, ge=1.0, le=30.0),
+        infer_steps: int = Input(default=100, ge=20, le=100),
+        guidance_scale: float = Input(default=30.0, ge=1.0, le=30.0),
         scheduler_type: str = Input(default="euler", choices=["euler", "heun", "pingpong"]),
         cfg_type: str = Input(default="apg", choices=["apg", "cfg", "cfg_star"]),
         omega_scale: float = Input(default=10.0, ge=1.0, le=20.0),
