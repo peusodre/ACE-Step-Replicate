@@ -1546,15 +1546,14 @@ class ACEStepPipeline:
             repaint_end = audio_duration
 
         src_latents = None
-        if src_audio_path is not None:
-            assert src_audio_path is not None and task in (
-                "repaint",
-                "edit",
-                "extend",
-            ), "src_audio_path is required for retake/repaint/extend task"
+        if task in ("repaint", "edit", "extend"):
+            assert src_audio_path is not None, "src_audio_path is required for retake/repaint/extend task"
             assert os.path.exists(
                 src_audio_path
             ), f"src_audio_path {src_audio_path} does not exist"
+            src_latents = self.infer_latents(src_audio_path)
+        elif src_audio_path is not None:
+            # Handle case where src_audio_path is provided but task doesn't require it
             src_latents = self.infer_latents(src_audio_path)
         
         ref_latents = None
