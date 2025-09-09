@@ -259,12 +259,14 @@ class Predictor(BasePredictor):
         if input_audio is not None:
             input_audio_path = os.path.join(temp_dir, "input_audio.wav")
             with open(input_audio_path, "wb") as f:
-                f.write(input_audio.read())
+                with open(input_audio, "rb") as input_file:
+                    f.write(input_file.read())
         
         if reference_audio is not None:
             reference_audio_path = os.path.join(temp_dir, "reference_audio.wav")
             with open(reference_audio_path, "wb") as f:
-                f.write(reference_audio.read())
+                with open(reference_audio, "rb") as ref_file:
+                    f.write(ref_file.read())
         
         # Validate and process inputs based on task type
         self._validate_inputs(task, input_audio_path, reference_audio_path, inpaint_start_time, inpaint_end_time)
