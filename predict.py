@@ -10,7 +10,7 @@ import os
 import tempfile
 import torch
 import inspect
-from typing import Optional
+from typing import Optional, Dict, Any, List
 from cog import BasePredictor, Input, Path
 
 from acestep.pipeline_ace_step import ACEStepPipeline
@@ -18,7 +18,6 @@ from acestep.pipeline_ace_step import ACEStepPipeline
 
 # ---- Task normalization ------------------------------------------------------
 
-# Only expose a minimal, unambiguous set
 USER_TASK_CHOICES = [
     "text2music",
     "audio2audio",
@@ -28,9 +27,6 @@ USER_TASK_CHOICES = [
 ]
 
 def canonicalize_task(user_task: str) -> str:
-    """
-    Map user-facing task to the canonical pipeline task names.
-    """
     if user_task == "extend":
         return "extend"
     if user_task == "repaint":
@@ -42,11 +38,95 @@ def canonicalize_task(user_task: str) -> str:
     return "text2music"
 
 
+# ---- Signature-aware remapping ----------------------------------------------
+
+# For different ACE-Step forks, __call__ may use alternate kwarg names.
+KWARG_ALIASES: Dict[str, List[str]] = {
+    # logical key -> list of possible arg names in priority order
+    "task": ["task", "mode", "task_name", "task_type"],
+    "src_audio_path": ["src_audio_path", "src_audio", "src_path", "source_audio_path"],
+    "repaint_start": ["repaint_start", "start", "edit_start", "inpaint_start"],
+    "repaint_end": ["repaint_end", "end", "edit_end", "inpaint_end"],
+    "audio_duration": ["audio_duration", "duration", "total_length"],
+    "prompt": ["prompt", "tags", "text_prompt"],
+    "lyrics": ["lyrics", "lyric", "text_lyrics"],
+    "infer_step": ["infer_step", "infer_steps", "num_inference_steps"],
+    "guidance_scale": ["guidance_scale", "cfg_scale"],
+    "scheduler_type": ["scheduler_type", "scheduler"],
+    "cfg_type": ["cfg_type", "guidance_type"],
+    "omega_scale": ["omega_scale", "omega"],
+    "manual_seeds": ["manual_seeds", "seed_list", "seeds"],
+    "guidance_interval": ["guidance_interval"],
+    "guidance_interval_decay": ["guidance_interval_decay"],
+    "min_guidance_scale": ["min_guidance_scale", "min_cfg_scale"],
+    "use_erg_tag": ["use_erg_tag"],
+    "use_erg_lyric": ["use_erg_lyric"],
+    "use_erg_diffusion": ["use_erg_diffusion"],
+    "guidance_scale_text": ["guidance_scale_text"],
+    "guidance_scale_lyric": ["guidance_scale_lyric"],
+    "audio2audio_enable": ["audio2audio_enable", "a2a_enable"],
+    "ref_audio_input": ["ref_audio_input", "reference_audio", "ref_audio_path"],
+    "ref_audio_strength": ["ref_audio_strength", "reference_strength"],
+    "retake_seeds": ["retake_seeds", "variation_seeds"],
+    "retake_variance": ["retake_variance", "variation_strength"],
+    "edit_target_prompt": ["edit_target_prompt", "target_prompt"],
+    "edit_target_lyrics": ["edit_target_lyrics", "target_lyrics"],
+    "edit_n_min": ["edit_n_min", "n_min"],
+    "edit_n_max": ["edit_n_max", "n_max"],
+    "edit_n_avg": ["edit_n_avg", "n_avg"],
+    "lora_name_or_path": ["lora_name_or_path", "lora", "lora_path"],
+    "lora_weight": ["lora_weight"],
+    "save_path": ["save_path", "output_dir"],
+    "batch_size": ["batch_size"],
+    "debug": ["debug"],
+    "oss_steps": ["oss_steps"],
+}
+
+def remap_to_signature(params: Dict[str, Any], callables_params: List[str]) -> Dict[str, Any]:
+    """
+    Given our canonical `params` and the actual __call__ param names,
+    produce a dict with the best-matching names per alias list.
+    """
+    accepted = set(callables_params)
+    remapped: Dict[str, Any] = {}
+    used_targets = set()
+
+    # First pass: try to map all known logical keys via alias list
+    for logical_key, value in params.items():
+        if logical_key in KWARG_ALIASES:
+            for alt in KWARG_ALIASES[logical_key]:
+                if alt in accepted and alt not in used_targets:
+                    remapped[alt] = value
+                    used_targets.add(alt)
+                    break
+        else:
+            # If logical_key itself is directly accepted, keep it
+            if logical_key in accepted and logical_key not in used_targets:
+                remapped[logical_key] = value
+                used_targets.add(logical_key)
+
+    # Second pass: include any additional keys that already exactly match signature
+    for k, v in params.items():
+        if k in accepted and k not in used_targets:
+            remapped[k] = v
+            used_targets.add(k)
+
+    # Debug print to see what we ended up sending
+    print("DEBUG accepted __call__ kwargs:", sorted(accepted))
+    print("DEBUG remapped kwargs keys:", sorted(remapped.keys()))
+    # Helpful: show mapped 'task' and 'src_audio_path' equivalents
+    task_key = next((alt for alt in KWARG_ALIASES["task"] if alt in remapped), None)
+    src_key = next((alt for alt in KWARG_ALIASES["src_audio_path"] if alt in remapped), None)
+    print("DEBUG task key/value:", task_key, remapped.get(task_key) if task_key else None)
+    print("DEBUG src key/value:", src_key, remapped.get(src_key) if src_key else None)
+
+    return remapped
+
+
 class Predictor(BasePredictor):
     def setup(self) -> None:
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-        # Conservative dtype selection
         dtype = "bfloat16"
         try:
             if torch.backends.mps.is_available():
@@ -166,7 +246,6 @@ class Predictor(BasePredictor):
     ) -> Path:
         temp_dir = tempfile.mkdtemp()
 
-        # Normalize task once; this is the *only* place we decide the canonical task.
         canonical_task = canonicalize_task(task)
 
         # Materialize audio files (as plain string paths)
@@ -181,7 +260,7 @@ class Predictor(BasePredictor):
             with open(reference_audio_path, "wb") as f, open(reference_audio, "rb") as fr:
                 f.write(fr.read())
 
-        # Validate user intent against required inputs
+        # Validate
         self._validate_inputs(
             canonical_task,
             input_audio_path,
@@ -190,7 +269,7 @@ class Predictor(BasePredictor):
             inpaint_end_time,
         )
 
-        # Compose prompt/lyrics (style transfer uses overrides)
+        # Compose prompt/lyrics
         final_prompt = style_prompt if canonical_task == "edit" and style_prompt else prompt
         final_lyrics = style_lyrics if canonical_task == "edit" and style_lyrics else lyrics
 
@@ -198,28 +277,26 @@ class Predictor(BasePredictor):
         manual_seeds = [seed] if seed is not None else None
         retake_seeds = [variation_seed] if variation_seed is not None else manual_seeds
 
-        # Compute actual duration for tasks that depend on src audio
+        # Duration (for tasks that depend on src audio)
         actual_audio_duration = audio_duration
         if input_audio_path and canonical_task in ("extend", "repaint", "edit"):
             import librosa
             actual_audio_duration = float(librosa.get_duration(path=input_audio_path))
 
-        # Build task-specific args (no redundancy)
+        # Task specifics
         task_kwargs = {
-            "task": canonical_task,          # canonical value the pipeline expects
-            "src_audio_path": None,          # set below when needed
+            "task": canonical_task,
+            "src_audio_path": None,
             "repaint_start": 0.0,
             "repaint_end": 0.0,
         }
 
         if canonical_task == "extend":
-            # Extend both sides
             task_kwargs.update({
                 "src_audio_path": input_audio_path,
                 "repaint_start": -float(extend_duration),
                 "repaint_end": actual_audio_duration + float(extend_duration),
             })
-            # total output duration is symmetric extend
             audio_duration_out = actual_audio_duration + 2.0 * float(extend_duration)
         elif canonical_task == "repaint":
             task_kwargs.update({
@@ -234,10 +311,9 @@ class Predictor(BasePredictor):
             })
             audio_duration_out = actual_audio_duration
         else:
-            # text2music / audio2audio
             audio_duration_out = audio_duration
 
-        # Minimal, consistent pipeline kwargs (intentionally no 'task_type')
+        # Canonical pipeline kwargs (we will remap to actual signature)
         pipeline_params = {
             "format": output_format,
             "audio_duration": audio_duration_out,
@@ -258,15 +334,11 @@ class Predictor(BasePredictor):
             "guidance_scale_text": float(guidance_scale_text),
             "guidance_scale_lyric": float(guidance_scale_lyric),
 
-            # ✅ Only `task`
             "task": task_kwargs["task"],
-
-            # Source region args (no-op if not used by the task)
             "src_audio_path": task_kwargs.get("src_audio_path"),
             "repaint_start": task_kwargs.get("repaint_start", 0.0),
             "repaint_end": task_kwargs.get("repaint_end", 0.0),
 
-            # Audio2Audio/style-conditioning knobs (set only when meaningful)
             "audio2audio_enable": (task in ("audio2audio", "extend")),
             "ref_audio_input": input_audio_path if task in ("audio2audio", "extend", "style_transfer") else None,
             "ref_audio_strength": (
@@ -276,14 +348,12 @@ class Predictor(BasePredictor):
                 else 0.5
             ),
 
-            # Variation / repaint variance
             "retake_seeds": retake_seeds,
             "retake_variance": (
                 float(repaint_strength) if canonical_task == "repaint"
                 else float(variation_strength)
             ),
 
-            # LoRA / output / misc
             "lora_name_or_path": lora_name_or_path,
             "lora_weight": float(lora_weight),
             "save_path": temp_dir,
@@ -292,21 +362,21 @@ class Predictor(BasePredictor):
             "oss_steps": [],
         }
 
-        # Final existence sanity for src path (useful when debugging envs)
         if pipeline_params["src_audio_path"]:
             print("DEBUG exists(src_audio_path):", os.path.exists(pipeline_params["src_audio_path"]))
 
-        # ---- Prune kwargs to EXACT signature of ACEStepPipeline.__call__ ----
+        # ---- Remap & prune to match the actual __call__ signature ------------
         try:
-            call_sig = inspect.signature(self.pipeline.__call__)
-            accepted = set(call_sig.parameters.keys())
-            filtered_params = {k: v for k, v in pipeline_params.items() if k in accepted}
-            if len(filtered_params) != len(pipeline_params):
-                dropped = sorted(set(pipeline_params.keys()) - set(filtered_params.keys()))
-                print("DEBUG dropped kwargs (not in __call__ signature):", dropped)
+            sig = inspect.signature(self.pipeline.__call__)
+            accepted_names = list(sig.parameters.keys())
+            filtered_params = remap_to_signature(pipeline_params, accepted_names)
+
+            # Extra sanity: if 'task' (or alias) isn’t accepted, warn loudly.
+            if not any(name in filtered_params for name in KWARG_ALIASES["task"]):
+                print("WARNING: No accepted 'task' kwarg name found in signature. Default inside pipeline may be 'text2music'.")
 
             output_paths = self.pipeline(**filtered_params)
-            return Path(output_paths[0])  # [audio_path, params_json]
+            return Path(output_paths[0])
         except Exception as e:
             raise RuntimeError(f"Prediction failed for task '{task}': {e}")
 
