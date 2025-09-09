@@ -388,7 +388,7 @@ class Predictor(BasePredictor):
             import librosa
             # Convert Path to string for librosa
             audio_file_path = str(input_audio) if hasattr(input_audio, '__fspath__') else input_audio
-            actual_audio_duration = librosa.get_duration(filename=audio_file_path)
+            actual_audio_duration = librosa.get_duration(path=audio_file_path)
         
         params = {
             "audio_duration": actual_audio_duration,
@@ -413,13 +413,13 @@ class Predictor(BasePredictor):
             # Audio extension - match Gradio implementation exactly
             params.update({
                 "task_type": "extend",
-                "src_audio_path": input_audio,
+                "src_audio_path": input_audio_path,  # Use the temporary file path, not the Path object
                 "repaint_start": -extend_duration,  # left_extend_length
                 "repaint_end": actual_audio_duration + extend_duration,  # actual_audio_duration + right_extend_length
                 "audio_duration": actual_audio_duration + 2 * extend_duration,  # Total output duration
                 # Enable audio2audio to condition generation on input audio style
                 "audio2audio_enable": True,
-                "ref_audio_input": input_audio,
+                "ref_audio_input": input_audio_path,  # Use the temporary file path
                 "ref_audio_strength": extend_strength,  # User-controlled influence from input audio
             })
         
@@ -427,7 +427,7 @@ class Predictor(BasePredictor):
             # Audio repainting - match Gradio implementation exactly
             params.update({
                 "task_type": "repaint",
-                "src_audio_path": input_audio,
+                "src_audio_path": input_audio_path,  # Use the temporary file path, not the Path object
                 "repaint_start": inpaint_start_time,
                 "repaint_end": inpaint_end_time,
                 "audio_duration": actual_audio_duration,  # Use actual audio duration
@@ -440,7 +440,7 @@ class Predictor(BasePredictor):
             # Style transfer using edit mode
             params.update({
                 "task_type": "edit",
-                "src_audio_path": input_audio,
+                "src_audio_path": input_audio_path,  # Use the temporary file path, not the Path object
                 "edit_n_min": 1.0 - style_strength,  # Higher strength = lower n_min
                 "edit_n_max": 1.0,
                 "edit_n_avg": 1,
@@ -449,7 +449,7 @@ class Predictor(BasePredictor):
             
             if reference_audio:
                 # Use reference audio for style guidance
-                params["ref_audio_input"] = reference_audio
+                params["ref_audio_input"] = reference_audio_path  # Use the temporary file path
                 params["ref_audio_strength"] = 0.3  # Moderate influence
         
         elif task == "vocal_accompaniment":
@@ -457,7 +457,7 @@ class Predictor(BasePredictor):
             # This would require specialized LoRA or controlnet in full implementation
             params.update({
                 "task_type": "text2music",
-                "src_audio_path": input_audio,
+                "src_audio_path": input_audio_path,  # Use the temporary file path, not the Path object
                 "audio_duration": actual_audio_duration,  # Use actual audio duration
             })
             
