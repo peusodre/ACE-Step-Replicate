@@ -283,8 +283,8 @@ class Predictor(BasePredictor):
             # Configure task-specific parameters
             task_params = self._configure_task_parameters(
                 task=task,
-                input_audio=input_audio_path,
-                reference_audio=reference_audio_path,
+                input_audio=input_audio,
+                reference_audio=reference_audio,
                 inpaint_start_time=inpaint_start_time,
                 inpaint_end_time=inpaint_end_time,
                 repaint_strength=repaint_strength,
@@ -295,7 +295,9 @@ class Predictor(BasePredictor):
                 variation_strength=variation_strength,
                 generate_accompaniment=generate_accompaniment,
                 accompaniment_style=accompaniment_style,
-                audio_duration=audio_duration
+                audio_duration=audio_duration,
+                input_audio_path=input_audio_path,
+                reference_audio_path=reference_audio_path
             )
             
             # Run the ACE-Step pipeline with all parameters
@@ -379,7 +381,8 @@ class Predictor(BasePredictor):
                                  inpaint_start_time: float, inpaint_end_time: float, repaint_strength: float,
                                  extend_duration: float, extend_strength: float, style_strength: float, 
                                  audio2audio_strength: float, variation_strength: float, generate_accompaniment: bool, 
-                                 accompaniment_style: str, audio_duration: float) -> dict:
+                                 accompaniment_style: str, audio_duration: float, input_audio_path: Optional[str] = None,
+                                 reference_audio_path: Optional[str] = None) -> dict:
         """Configure task-specific parameters for the pipeline."""
         
         # Get actual audio duration for tasks that use input audio
