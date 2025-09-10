@@ -230,6 +230,10 @@ class Predictor(BasePredictor):
             description="Extend by tiling only (no diffusion/inpainting). For diagnostics.",
             default=False,
         ),
+        extend_edge_bootstrap_only: bool = Input(
+            description="Extend by edge bootstrap only (no diffusion/inpainting). For diagnostics.",
+            default=False,
+        ),
 
         # ---- Style transfer (edit) -------------------------------------------
         style_prompt: str = Input(
@@ -439,6 +443,7 @@ class Predictor(BasePredictor):
             "seam_seconds": float(seam_seconds),
             "extend_pad_mode": str(extend_pad_mode),
             "extend_tile_only": bool(extend_tile_only),
+            "extend_edge_bootstrap_only": bool(extend_edge_bootstrap_only),
         }
 
         if pipeline_params["src_audio_path"]:

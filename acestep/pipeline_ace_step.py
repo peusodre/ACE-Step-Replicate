@@ -861,6 +861,7 @@ class ACEStepPipeline:
         seam_seconds=0.75,
         extend_pad_mode="boot_only",
         extend_tile_only=False,
+        extend_edge_bootstrap_only=False,   # <--- NEW
     ):
 
         logger.info(
@@ -868,6 +869,11 @@ class ACEStepPipeline:
                 cfg_type, guidance_scale, omega_scale
             )
         )
+        
+        # Make the two "only" modes mutually exclusive
+        if extend_tile_only and extend_edge_bootstrap_only:
+            logger.warning("Both extend_tile_only and extend_edge_bootstrap_only were set; defaulting to extend_edge_bootstrap_only.")
+            extend_tile_only = False
         do_classifier_free_guidance = True
         if guidance_scale == 0.0 or guidance_scale == 1.0:
             do_classifier_free_guidance = False
@@ -1169,6 +1175,28 @@ class ACEStepPipeline:
 
                     return tiled_latents
                 # === END TILE-ONLY FAST PATH ===
+
+                # === EDGE-BOOTSTRAP-ONLY FAST PATH (no repaint/diffusion) ===
+                if is_extend and extend_edge_bootstrap_only:
+                    # We already built left_seed/right_seed using _bootstrap_from_tile(...)
+                    # and assembled z0 from [left_seed | mid | right_seed].
+                    # To isolate bootstrap, just return z0 (RMS-matched) directly.
+                    # (Keep the same stats-match you already have)
+                    def _match_stats(z, ref, eps=1e-6):
+                        m_ref = ref.mean(dim=(1, 2, 3), keepdim=True)
+                        s_ref = ref.std(dim=(1, 2, 3), keepdim=True) + eps
+                        m_z = z.mean(dim=(1, 2, 3), keepdim=True)
+                        s_z = z.std(dim=(1, 2, 3), keepdim=True) + eps
+                        return (z - m_z) * (s_ref / s_z) + m_ref
+
+                    bootstrapped = _match_stats(z0, x0)
+                    logger.info("[BOOTSTRAP-ONLY] returning edge-conditioned bootstrap latents "
+                                f"without diffusion/inpainting. shape={tuple(bootstrapped.shape)} "
+                                f"left_pad={left_pad} right_pad={right_pad} "
+                                f"method={extend_bootstrap_method} pad_mode={extend_pad_mode} "
+                                f"strength={extend_bootstrap_strength}")
+                    return bootstrapped
+                # === END EDGE-BOOTSTRAP-ONLY FAST PATH ===
 
                 # Build repaint mask in the padded space
                 repaint_mask = torch.zeros_like(gt_latents)
@@ -1825,6 +1853,7 @@ class ACEStepPipeline:
         seam_seconds: float = 0.75,
         extend_pad_mode: str = "boot_only",
         extend_tile_only: bool = False,   # <--- NEW
+        extend_edge_bootstrap_only: bool = False,
     ):
 
         start_time = time.time()
@@ -2018,6 +2047,7 @@ class ACEStepPipeline:
                 seam_seconds=seam_seconds,
                 extend_pad_mode=extend_pad_mode,
                 extend_tile_only=extend_tile_only,
+                extend_edge_bootstrap_only=extend_edge_bootstrap_only,
             )
 
         end_time = time.time()
