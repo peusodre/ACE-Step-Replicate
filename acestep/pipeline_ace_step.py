@@ -1089,9 +1089,10 @@ class ACEStepPipeline:
                 def _smooth_time(x, k=5):
                     # tiny time smoothing to avoid repeating high-freq transients
                     B, C, H, T = x.shape
-                    x_ = x.view(B * C, H, T)
+                    dtype_orig = x.dtype
+                    x_ = x.to(torch.float32).view(B * C, H, T)
                     x_ = torch.nn.functional.avg_pool1d(x_, kernel_size=k, stride=1, padding=k // 2)
-                    return x_.view(B, C, H, T)
+                    return x_.to(dtype_orig).view(B, C, H, T)
 
                 def _rms(x, eps=1e-6):
                     # RMS over time axis only
@@ -1168,6 +1169,12 @@ class ACEStepPipeline:
                     s = frame_length - right_pad
                     repaint_mask[..., s : s + L] = ramp  # 0 -> 1 leaving the seam
 
+                # tilt mask by frequency: keep lows closer to original at the seam
+                Hdim = x0.shape[2]
+                fgrid = torch.linspace(0.0, 1.0, steps=Hdim, device=self.device, dtype=self.dtype).view(1, 1, Hdim, 1)
+                freq_tilt = 0.65 + 0.35 * fgrid  # 0.65 at low freqs → 1.0 at highs
+                repaint_mask = repaint_mask * freq_tilt
+
                 # Match global stats of z0 to the (padded) source latents to keep distributions compatible
                 def _match_stats(z, ref, eps=1e-6):
                     m_ref = ref.mean(dim=(1, 2, 3), keepdim=True)
@@ -1181,6 +1188,23 @@ class ACEStepPipeline:
 
                 logger.info(f"[EXTEND] (improved) EDGE={EDGE}  ramp_len={ramp_len}  theta_near={float(theta_near):.2f}  theta_far={float(theta_far):.2f}")
                 logger.info(f"[EXTEND] x0.shape={x0.shape}  z0.shape={z0.shape}  target_latents.shape={target_latents.shape}")
+                
+                # --- make sure long pad gets enough diffusion steps ---
+                pad_sec_total = (left_pad + right_pad) / max(1.0, fps)
+                if pad_sec_total >= 10.0:
+                    target_steps = max(int(infer_steps), 60 + int(pad_sec_total * 3.0))
+                else:
+                    target_steps = max(int(infer_steps), 80)
+                if target_steps != num_inference_steps:
+                    timesteps, num_inference_steps = retrieve_timesteps(
+                        scheduler,
+                        num_inference_steps=target_steps,
+                        device=self.device,
+                        timesteps=None,
+                    )
+                    # keep downstream logic in sync
+                    infer_steps = target_steps
+                    logger.info(f"[EXTEND] timesteps recomputed → {num_inference_steps} steps")
 
         if audio2audio_enable and ref_latents is not None:
             logger.info(
@@ -1204,6 +1228,7 @@ class ACEStepPipeline:
         if is_extend:
             start_idx = 0
             end_idx = num_inference_steps
+            guidance_interval_decay = 0.0
             logger.info("Extend mode: using full-range guidance.")
         
         logger.info(
