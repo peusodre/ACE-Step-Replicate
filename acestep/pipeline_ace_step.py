@@ -854,6 +854,11 @@ class ACEStepPipeline:
         ref_latents=None,
         extend_strength=0.7,
         sample_rate=48000,
+        # ---- extend bootstrap controls ----
+        extend_bootstrap=True,
+        extend_bootstrap_method="a2a",
+        extend_bootstrap_strength=0.6,
+        seam_seconds=0.75,
     ):
 
         logger.info(
@@ -1080,7 +1085,7 @@ class ACEStepPipeline:
                     repaint_mask[..., -right_pad:] = 1.0
                 x0 = gt_latents  # reference for blending and zt_src construction
                 
-                # ---- Improved seeding for long extends: ramped, energy-matched, multi-second context ----
+                # ---- Improved seeding for long extends: ramped, energy-matched, multi-second context (+ optional a2a/style bootstrap) ----
 
                 # Use a longer context for long pads (2–3s), but never larger than the clip/8
                 EDGE = int(min(max(128, x0.shape[-1] // 8), max(128, int(3.0 * fps))))
@@ -1121,6 +1126,38 @@ class ACEStepPipeline:
 
                 left_seed = None
                 right_seed = None
+                # Helper to run latent a2a/style bootstrap on a tiled edge chunk
+                def _bootstrap_from_tile(tile_like, want_len):
+                    """
+                    Returns a2a/style bootstrapped latent the same shape as 'tile_like[..., :want_len]'.
+                    Uses add_latents_noise with sigma_max=(1-strength).
+                    """
+                    # Create matching noise slice to drive add_latents_noise
+                    noise_like = retake_latents[..., :want_len]
+                    if noise_like.shape[-1] != want_len:
+                        noise_like = torch.nn.functional.pad(noise_like, (0, want_len - noise_like.shape[-1]))
+                    # Choose reference (style) if requested and available
+                    ref_like = tile_like[..., :want_len]
+                    if extend_bootstrap_method == "style" and (ref_latents is not None):
+                        # take a similarly sized chunk from ref_latents tail/head
+                        # fall back to tile_like if shapes mismatch
+                        try:
+                            if tile_like is right_edge_tiled:
+                                ref_like = ref_latents[..., -want_len:]
+                            else:
+                                ref_like = ref_latents[..., :want_len]
+                        except Exception:
+                            ref_like = tile_like[..., :want_len]
+                    # Run a2a-style latent mixing
+                    boot, _, _, _ = self.add_latents_noise(
+                        gt_latents=ref_like,
+                        sigma_max=(1.0 - float(extend_bootstrap_strength)),
+                        noise=noise_like,
+                        scheduler_type=scheduler_type,
+                        infer_steps=infer_steps,
+                    )
+                    # match RMS back to the edge (prevents hiss)
+                    return _match_rms(boot, ref_like)
 
                 if left_pad > 0:
                     # mirror the beginning for continuity, then smooth
@@ -1128,9 +1165,17 @@ class ACEStepPipeline:
                     left_edge_tiled = _tile_edge(left_edge, left_pad)
 
                     theta_vec = _ramp_theta(left_pad, theta_near, theta_far).view(1, 1, 1, -1)
-                    # energy-match the noise to the edge to avoid hiss
+                    # base: energy-match random to edge
                     left_noise = _match_rms(retake_latents[..., :left_pad], left_edge_tiled)
-                    left_seed = theta_vec * left_edge_tiled + (1.0 - theta_vec) * left_noise
+                    base_seed = left_noise
+                    # optional: bootstrap from edge context via a2a/style
+                    if extend_bootstrap:
+                        try:
+                            boot = _bootstrap_from_tile(left_edge_tiled, left_pad)
+                            base_seed = boot
+                        except Exception as _:
+                            pass  # fall back to noise if anything fails
+                    left_seed = theta_vec * left_edge_tiled + (1.0 - theta_vec) * base_seed
 
                 if right_pad > 0:
                     # take the end as-is (no mirror), then smooth
@@ -1139,7 +1184,14 @@ class ACEStepPipeline:
 
                     theta_vec = _ramp_theta(right_pad, theta_near, theta_far).view(1, 1, 1, -1)
                     right_noise = _match_rms(retake_latents[..., -right_pad:], right_edge_tiled)
-                    right_seed = theta_vec * right_edge_tiled + (1.0 - theta_vec) * right_noise
+                    base_seed = right_noise
+                    if extend_bootstrap:
+                        try:
+                            boot = _bootstrap_from_tile(right_edge_tiled, right_pad)
+                            base_seed = boot
+                        except Exception as _:
+                            pass
+                    right_seed = theta_vec * right_edge_tiled + (1.0 - theta_vec) * base_seed
 
                 # Assemble z0 using the original mid-noise (trimmed as before to stay aligned)
                 mid = target_latents[..., left_trim : target_latents.shape[-1] - right_trim]
@@ -1154,15 +1206,15 @@ class ACEStepPipeline:
                 z0 = torch.cat(parts, dim=-1)
                 zt_edit = x0.clone()
 
-                # --- Soft seam like inpaint: binary mask with a short time ramp only
-                # Start from binary (pad=1, original=0), then taper ~0.5s near both seams inside the pad
+                # --- Soft seam: make a tapered repaint mask near the seam to avoid a hard boundary ---
+                # Start from binary (pad=1, original=0), then taper `seam_seconds` near both seams inside the pad
                 repaint_mask = torch.zeros_like(zt_edit)
                 if left_pad > 0:
                     repaint_mask[..., :left_pad] = 1.0
                 if right_pad > 0:
                     repaint_mask[..., -right_pad:] = 1.0
 
-                ramp_len = int(max(1, round(0.50 * fps)))  # ~0.5s taper is enough
+                ramp_len = int(max(1, round(float(seam_seconds) * fps)))
                 if left_pad > 0:
                     L = min(ramp_len, left_pad)
                     ramp = torch.linspace(1.0, 0.0, steps=L, device=self.device, dtype=self.dtype).view(1, 1, 1, L)
@@ -1630,6 +1682,11 @@ class ACEStepPipeline:
         debug: bool = False,
         extend_strength: float = 0.7,
         sample_rate: int = 48000,
+        # ---- extend bootstrap controls ----
+        extend_bootstrap: bool = True,
+        extend_bootstrap_method: str = "a2a",  # "a2a" or "style"
+        extend_bootstrap_strength: float = 0.6,
+        seam_seconds: float = 0.75,
     ):
 
         start_time = time.time()
@@ -1818,6 +1875,10 @@ class ACEStepPipeline:
                 ref_latents=ref_latents,
                 extend_strength=extend_strength,
                 sample_rate=sample_rate,
+                extend_bootstrap=extend_bootstrap,
+                extend_bootstrap_method=extend_bootstrap_method,
+                extend_bootstrap_strength=extend_bootstrap_strength,
+                seam_seconds=seam_seconds,
             )
 
         end_time = time.time()

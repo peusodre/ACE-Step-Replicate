@@ -204,6 +204,23 @@ class Predictor(BasePredictor):
             description="How closely to follow source style in extend (0..1)",
             default=0.7, ge=0.0, le=1.0,
         ),
+        # ---- Extend bootstrap (a2a/style) -----------------------------------
+        extend_bootstrap: bool = Input(
+            description="Bootstrap extend by generating continuation via audio2audio/style, then repaint seam",
+            default=True,
+        ),
+        extend_bootstrap_method: str = Input(
+            description="Bootstrap method for extend",
+            default="a2a", choices=["a2a", "style"],
+        ),
+        extend_bootstrap_strength: float = Input(
+            description="How strongly the bootstrap should transform the edge context (0..1). Higher = more change.",
+            default=0.6, ge=0.0, le=1.0,
+        ),
+        seam_seconds: float = Input(
+            description="Duration of tapered repaint seam at the join (seconds)",
+            default=0.75, ge=0.1, le=2.0,
+        ),
 
         # ---- Style transfer (edit) -------------------------------------------
         style_prompt: str = Input(
@@ -401,6 +418,11 @@ class Predictor(BasePredictor):
             "oss_steps": [],
             "extend_strength": float(extend_strength),  # pass it through
             "sample_rate": int(sample_rate),  # pass sample rate through
+            # ---- extend bootstrap controls ----
+            "extend_bootstrap": bool(extend_bootstrap),
+            "extend_bootstrap_method": str(extend_bootstrap_method),
+            "extend_bootstrap_strength": float(extend_bootstrap_strength),
+            "seam_seconds": float(seam_seconds),
         }
 
         if pipeline_params["src_audio_path"]:
