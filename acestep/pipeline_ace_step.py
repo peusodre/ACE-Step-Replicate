@@ -919,6 +919,9 @@ class ACEStepPipeline:
         frame_length = int(duration * fps)
         if src_latents is not None:
             frame_length = src_latents.shape[-1]
+            
+        logger.info(f"[DBG] fps={fps:.6f}  infer_steps={infer_steps}  guidance_scale={guidance_scale}  min_cfg={min_guidance_scale} cfg_type={cfg_type} scheduler={type(scheduler).__name__}")
+        logger.info(f"[DBG] initial frame_length={frame_length}  src_latents={'yes' if src_latents is not None else 'no'}  ref_latents={'yes' if ref_latents is not None else 'no'}")
         
         if ref_latents is not None:
             frame_length = ref_latents.shape[-1]
@@ -970,6 +973,26 @@ class ACEStepPipeline:
             # ensure the '== n_min' branch is reachable
             n_min = max(1, min(n_min, infer_steps - 1))
             
+            def _choose_n_min_by_sigma(target_sigma=0.20):
+                # find earliest i where scheduler sigma <= target_sigma
+                try:
+                    # ensure scheduler indices initialized
+                    _ = scheduler.sigmas
+                    for i, t in enumerate(timesteps):
+                        scheduler._init_step_index(t)
+                        sig = float(scheduler.sigmas[scheduler.step_index].detach().cpu())
+                        if sig <= target_sigma:
+                            return max(1, i)  # keep >=1
+                except Exception:
+                    pass
+                return None
+
+            # Override n_min to ensure low sigma repaint
+            late = _choose_n_min_by_sigma(0.20)
+            if late is not None and late > n_min:
+                logger.info(f"[DBG] overriding n_min {n_min} -> {late} to ensure low sigma repaint")
+                n_min = late
+            
             # Angle (tensor) used for mixing latents
             retake_variance = (
                 torch.tensor(retake_frac * math.pi / 2).to(self.device).to(self.dtype)
@@ -988,6 +1011,11 @@ class ACEStepPipeline:
             # Log extend/repaint setup details
             logger.info(f"repaint_start={repaint_start}, repaint_end={repaint_end}")
             logger.info(f"src_len_frames={src_latents.shape[-1] if src_latents is not None else None}, frame_length={frame_length}")
+            
+            def _sec(frames): 
+                return frames / max(1.0, fps)
+            
+            logger.info(f"[DBG] repaint_start_frame={repaint_start_frame} ({_sec(repaint_start_frame):.3f}s)  repaint_end_frame={repaint_end_frame} ({_sec(repaint_end_frame):.3f}s)")
             
         # Only if we're repainting/retaking/extending (i.e., add_retake_noise) AND we have src_latents
         if add_retake_noise and (src_latents is not None):
@@ -1077,6 +1105,9 @@ class ACEStepPipeline:
                 # Debug log for extend padding with seconds
                 f2s = lambda f: f / fps
                 logger.info(f"[EXTEND] src={src_len}f ({f2s(src_len):.2f}s) left_pad={left_pad}f ({f2s(left_pad):.2f}s) right_pad={right_pad}f ({f2s(right_pad):.2f}s) new_len={frame_length}f ({f2s(frame_length):.2f}s)")
+                
+                logger.info(f"[DBG] is_extend={is_extend}  extend_bootstrap={extend_bootstrap}  method={extend_bootstrap_method}  pad_mode={extend_pad_mode}")
+                logger.info(f"[DBG] trims: left_trim={left_trim} right_trim={right_trim}  mid_len(before concat)={target_latents.shape[-1] - left_trim - right_trim}")
 
                 # Build repaint mask in the padded space
                 repaint_mask = torch.zeros_like(gt_latents)
@@ -1161,6 +1192,8 @@ class ACEStepPipeline:
                         noise_like = _match_rms(retake_latents[..., :want_len], ref_like)
                         sigma_max = (1.0 - float(extend_bootstrap_strength))
 
+                    logger.info(f"[DBG] BOOT side={side} want_len={want_len} sigma_max={(1.0 - float(extend_bootstrap_strength)):.3f} using_ref={'global_ref' if (extend_bootstrap_method=='style' and ref_latents is not None) else 'edge_tile'} noise_like={'zeros' if extend_pad_mode=='boot_only' else 'retake_latents'} ref_like_shape={tuple(ref_like.shape)}")
+                    
                     boot, _, _, _ = self.add_latents_noise(
                         gt_latents=ref_like,
                         sigma_max=sigma_max,
@@ -1181,6 +1214,7 @@ class ACEStepPipeline:
                     if extend_bootstrap:
                         try:
                             base_seed = _bootstrap_from_tile(left_edge_tiled, left_pad, side="left")
+                            assert base_seed is not None and base_seed.shape[-1] == left_pad, "[ASSERT] bootstrap failed to produce base_seed"
                         except Exception:
                             base_seed = _match_rms(retake_latents[..., :left_pad], left_edge_tiled)
                     else:
@@ -1197,6 +1231,7 @@ class ACEStepPipeline:
                     if extend_bootstrap:
                         try:
                             base_seed = _bootstrap_from_tile(right_edge_tiled, right_pad, side="right")
+                            assert base_seed is not None and base_seed.shape[-1] == right_pad, "[ASSERT] bootstrap failed to produce base_seed"
                         except Exception:
                             base_seed = _match_rms(retake_latents[..., -right_pad:], right_edge_tiled)
                     else:
@@ -1215,6 +1250,15 @@ class ACEStepPipeline:
 
                 z0 = torch.cat(parts, dim=-1)
                 zt_edit = x0.clone()
+                
+                def _rms_t(x): 
+                    # RMS over last dimension (time)
+                    return float(torch.sqrt(torch.clamp((x * x).mean(dim=-1), 1e-6)).mean().detach().cpu())
+                
+                logger.info(f"[DBG] seeds: left_seed={'none' if left_seed is None else tuple(left_seed.shape)} right_seed={'none' if right_seed is None else tuple(right_seed.shape)} z0_shape={tuple(z0.shape)} x0_shape={tuple(x0.shape)}")
+                logger.info(f"[DBG] energy: rms(x0)={_rms_t(x0):.6f} rms(z0)={_rms_t(z0):.6f}")
+                
+                assert z0.shape[-1] == x0.shape[-1], "[ASSERT] z0/x0 length mismatch"
 
                 # --- Soft seam: make a tapered repaint mask near the seam to avoid a hard boundary ---
                 # Start from binary (pad=1, original=0), then taper `seam_seconds` near both seams inside the pad
@@ -1235,6 +1279,12 @@ class ACEStepPipeline:
                     s = frame_length - right_pad
                     repaint_mask[..., s : s + L] = ramp  # 0 -> 1 leaving the seam
                 # (no frequency tilt — match inpaint behavior)
+                
+                nz = int((repaint_mask > 0).sum().item())
+                logger.info(f"[DBG] repaint_mask nonzero={nz} ({nz / repaint_mask.numel():.4%})  ramp_len={ramp_len}")
+                
+                assert (repaint_mask[..., :left_pad].mean() >= 0.5 if left_pad>0 else True), "[ASSERT] left pad mask not set"
+                assert (repaint_mask[..., -right_pad:].mean() >= 0.5 if right_pad>0 else True), "[ASSERT] right pad mask not set"
 
                 # Match global stats of z0 to the (padded) source latents to keep distributions compatible
                 def _match_stats(z, ref, eps=1e-6):
@@ -1410,6 +1460,8 @@ class ACEStepPipeline:
                 target_latents = target_latents[..., :need]
             elif target_latents.shape[-1] < need:
                 target_latents = torch.nn.functional.pad(target_latents, (0, need - target_latents.shape[-1]))
+                
+            logger.info(f"[DBG] shape guard enforced: target_latents={tuple(target_latents.shape)} z0={tuple(z0.shape)} x0={tuple(x0.shape)} need={need}")
 
         for i, t in tqdm(enumerate(timesteps), total=num_inference_steps):
 
@@ -1421,6 +1473,14 @@ class ACEStepPipeline:
                     zt_src = (1 - t_i) * x0 + (t_i) * z0
                     target_latents = zt_edit + zt_src - x0
                     logger.info(f"repaint start from {n_min} add {t_i} level of noise")
+                    
+                    # Estimate sigma at this t (scheduler must be initialized)
+                    try:
+                        scheduler._init_step_index(t)
+                        sigma_here = float(scheduler.sigmas[scheduler.step_index].detach().cpu())
+                    except Exception:
+                        sigma_here = float(t_i)
+                    logger.info(f"[DBG] repaint n_min={n_min}/{num_inference_steps}  sigma≈{sigma_here:.4f}  retake_frac={float(retake_variance) if isinstance(retake_variance, torch.Tensor)==False else 'tensor'}")
 
             # expand the latents if we are doing classifier free guidance
             latents = target_latents
@@ -1548,6 +1608,9 @@ class ACEStepPipeline:
                 prev_sample = prev_sample.to(self.dtype)
                 target_latents = prev_sample
                 zt_src = (1 - t_im1) * x0 + (t_im1) * z0
+                
+                if i in (n_min, n_min+1, end_idx-1, end_idx):
+                    logger.info(f"[DBG] step={i}  t={float(t)/1000:.4f}  in_guidance={start_idx <= i < end_idx}  rms(prev)={_rms_t(prev_sample):.6f}")
                 # Soft blend (mask is 1.0 deep in pad, tapers to 0.0 at the seam)
                 target_latents = repaint_mask * target_latents + (1.0 - repaint_mask) * zt_src
             else:
@@ -1562,6 +1625,8 @@ class ACEStepPipeline:
 
         # Note: Re-append code removed - we already trimmed by reducing left_pad/right_pad
         # so there's nothing left to re-append
+        
+        logger.info(f"[DBG] DONE: is_extend={is_extend}  repaint={(is_repaint)}  final_latents={tuple(target_latents.shape)}  rms={_rms_t(target_latents):.6f}")
         return target_latents
 
     @cpu_offload("music_dcae")
