@@ -888,7 +888,9 @@ class ACEStepPipeline:
             )
 
         frame_length = int(duration * 44100 / 512 / 8)
-        if src_latents is not None:
+        if src_latents is not None and not add_retake_noise:
+            # For extend/repaint tasks, we need to use the extended frame length
+            # Only use src_latents length for non-extend tasks
             frame_length = src_latents.shape[-1]
         
         if ref_latents is not None:
@@ -1056,21 +1058,6 @@ class ACEStepPipeline:
             logger.info(
                 f"audio2audio_enable: {audio2audio_enable}, ref_latents: {ref_latents.shape}"
             )
-            
-            # Ensure ref_latents matches the (possibly extended) target length
-            target_len = target_latents.shape[-1]
-            ref_len = ref_latents.shape[-1]
-            if ref_len != target_len:
-                if ref_len < target_len:
-                    # pad zeros at the END to reach target length
-                    pad = target_len - ref_len
-                    ref_latents = torch.nn.functional.pad(ref_latents, (0, pad), mode="constant", value=0)
-                else:
-                    # rare case: trim if ref is somehow longer
-                    ref_latents = ref_latents[..., :target_len]
-                logger.info(f"Aligned ref_latents shape: {ref_latents.shape} to match target_latents: {target_latents.shape}")
-            
-            # now shapes match → safe to mix
             target_latents, timesteps, scheduler, num_inference_steps = self.add_latents_noise(
                 gt_latents=ref_latents,
                 sigma_max=(1-ref_audio_strength),
@@ -1356,7 +1343,7 @@ class ACEStepPipeline:
                 )
             if to_left_pad_gt_latents is not None:
                 target_latents = torch.cat(
-                    [to_left_pad_gt_latents, target_latents], dim=-1
+                    [to_right_pad_gt_latents, target_latents], dim=0
                 )
         return target_latents
 
@@ -1488,9 +1475,7 @@ class ACEStepPipeline:
 
         start_time = time.time()
 
-        # Only flip to audio2audio when we're doing plain text2music.
-        # For repaint/extend we want to KEEP the task and merely use ref conditioning.
-        if audio2audio_enable and ref_audio_input is not None and task == "text2music":
+        if audio2audio_enable and ref_audio_input is not None:
             task = "audio2audio"
 
         if not self.loaded:
