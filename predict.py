@@ -126,7 +126,7 @@ def remap_to_signature(params: Dict[str, Any], callables_params: List[str]) -> D
 class Predictor(BasePredictor):
     def setup(self) -> None:
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
+        
         dtype = "bfloat16"
         try:
             if torch.backends.mps.is_available():
@@ -147,7 +147,7 @@ class Predictor(BasePredictor):
             overlapped_decode=True,
         )
         self.pipeline.load_checkpoint()
-
+        
     def predict(
         self,
         # ---- Core UX inputs (de-duplicated) ----------------------------------
@@ -190,7 +190,7 @@ class Predictor(BasePredictor):
         ),
         repaint_strength: float = Input(
             description="How strongly to change the repainted region (0..1)",
-            default=0.7, ge=0.0, le=1.0,
+            default=0.5, ge=0.0, le=1.0,
         ),
         extend_duration: float = Input(
             description="Seconds to extend on both sides [extend only]",
@@ -218,12 +218,12 @@ class Predictor(BasePredictor):
         # ---- Audio2Audio -----------------------------------------------------
         audio2audio_strength: float = Input(
             description="Audio2Audio generation strength (0..1). Higher = more change.",
-            default=0.85, ge=0.0, le=1.0,
+            default=0.5, ge=0.0, le=1.0,
         ),
 
         # ---- Diffusion / guidance --------------------------------------------
-        infer_steps: int = Input(default=100, ge=20, le=100),
-        guidance_scale: float = Input(default=30.0, ge=1.0, le=30.0),
+        infer_steps: int = Input(default=60, ge=20, le=100),
+        guidance_scale: float = Input(default=15.0, ge=1.0, le=30.0),
         scheduler_type: str = Input(default="euler", choices=["euler", "heun", "pingpong"]),
         cfg_type: str = Input(default="apg", choices=["apg", "cfg", "cfg_star"]),
         omega_scale: float = Input(default=10.0, ge=1.0, le=20.0),
@@ -245,7 +245,7 @@ class Predictor(BasePredictor):
         sample_rate: int = Input(default=48000, choices=[44100, 48000]),
     ) -> Path:
         temp_dir = tempfile.mkdtemp()
-
+        
         canonical_task = canonicalize_task(task)
 
         # Materialize audio files (as plain string paths)
@@ -276,7 +276,7 @@ class Predictor(BasePredictor):
         # Seeds
         manual_seeds = [seed] if seed is not None else None
         retake_seeds = [variation_seed] if variation_seed is not None else manual_seeds
-
+        
         # Duration (for tasks that depend on src audio)
         actual_audio_duration = audio_duration
         if input_audio_path and canonical_task in ("extend", "repaint", "edit"):
@@ -292,20 +292,12 @@ class Predictor(BasePredictor):
         }
 
         if canonical_task == "extend":
-            # Right-append only: repaint from end -> end + extend_duration
-            # No negative start => no lead-in noise.
-            # We also bias the new tail toward the source with audio2audio conditioning.
             task_kwargs.update({
-                "task": "repaint",                          # pipeline expects 'task', not 'task_type'
-                "src_audio_path": input_audio_path,         # required for repaint/edit/extend
-                "repaint_start": actual_audio_duration,     # start repaint at the end of the source (seconds)
-                "repaint_end": actual_audio_duration + float(extend_duration),  # append N seconds to the right
-                "audio2audio_enable": True,                 # use source as reference for continuity
-                "ref_audio_input": input_audio_path,
-                "ref_audio_strength": float(extend_strength),  # 0..1; higher = closer to source
-                "retake_variance": 1e-6,                    # keep the existing region effectively frozen
+                "src_audio_path": input_audio_path,
+                "repaint_start": -float(extend_duration),
+                "repaint_end": actual_audio_duration + float(extend_duration),
             })
-            audio_duration_out = actual_audio_duration + float(extend_duration)
+            audio_duration_out = actual_audio_duration + 2.0 * float(extend_duration)
         elif canonical_task == "repaint":
             task_kwargs.update({
                 "src_audio_path": input_audio_path,
@@ -342,29 +334,27 @@ class Predictor(BasePredictor):
             "guidance_scale_text": float(guidance_scale_text),
             "guidance_scale_lyric": float(guidance_scale_lyric),
 
-            "task": task_kwargs.get("task", task),
+            "task": task_kwargs["task"],
             "src_audio_path": task_kwargs.get("src_audio_path"),
             "repaint_start": task_kwargs.get("repaint_start", 0.0),
             "repaint_end": task_kwargs.get("repaint_end", 0.0),
 
-            "audio2audio_enable": task_kwargs.get("audio2audio_enable", (task == "audio2audio")),
-            "ref_audio_input": task_kwargs.get("ref_audio_input", (
-                reference_audio_path if canonical_task == "edit" and reference_audio_path else
-                (input_audio_path if task == "audio2audio" else None)
-            )),
-            "ref_audio_strength": task_kwargs.get("ref_audio_strength", (
+            "audio2audio_enable": (task == "audio2audio"),
+            "ref_audio_input": input_audio_path if task == "audio2audio" else (
+                reference_audio_path if task == "style_transfer" else None
+            ),
+            "ref_audio_strength": (
                 float(1.0 - audio2audio_strength) if task == "audio2audio"
                 else float(extend_strength) if task == "extend"
                 else 0.3 if task == "style_transfer" and reference_audio_path
                 else 0.5
-            )),
+            ),
 
             "retake_seeds": retake_seeds,
-            "retake_variance": task_kwargs.get("retake_variance", (
+            "retake_variance": (
                 float(repaint_strength) if canonical_task == "repaint"
-                else 1e-6 if canonical_task == "extend"  # For extend, use tiny epsilon to preserve center
                 else float(variation_strength)
-            )),
+            ),
 
             "lora_name_or_path": lora_name_or_path,
             "lora_weight": float(lora_weight),

@@ -888,9 +888,7 @@ class ACEStepPipeline:
             )
 
         frame_length = int(duration * 44100 / 512 / 8)
-        if src_latents is not None and not add_retake_noise:
-            # For extend/repaint tasks, we need to use the extended frame length
-            # Only use src_latents length for non-extend tasks
+        if src_latents is not None:
             frame_length = src_latents.shape[-1]
         
         if ref_latents is not None:
@@ -948,8 +946,18 @@ class ACEStepPipeline:
                 device=self.device,
                 dtype=self.dtype,
             )
-            repaint_start_frame = int(repaint_start * 44100 / 512 / 8)
-            repaint_end_frame = int(repaint_end * 44100 / 512 / 8)
+            def sec_to_frames(sec: float) -> int:
+                return int(round(sec * 44100.0 / 512.0 / 8.0))
+            repaint_start_frame = sec_to_frames(repaint_start)
+            repaint_end_frame = sec_to_frames(repaint_end)
+            
+            # Clamp to actual src length and guarantee ordering
+            src_len = src_latents.shape[-1]
+            repaint_start_frame = max(-src_len, min(repaint_start_frame, src_len))
+            repaint_end_frame = max(0, min(repaint_end_frame, src_len))
+            if repaint_end_frame < repaint_start_frame:
+                repaint_end_frame = repaint_start_frame
+            
             x0 = src_latents
             # retake
             is_repaint = repaint_end_frame - repaint_start_frame != frame_length
@@ -1186,6 +1194,19 @@ class ACEStepPipeline:
 
             return sample
 
+        # Final shape guard: ensure z0 and target_latents match x0 along last dim
+        if is_repaint:
+            need = x0.shape[-1]
+            have = z0.shape[-1]
+            if have != need:
+                if have > need:
+                    z0 = z0[..., :need]  # trim
+                    target_latents = target_latents[..., :need]
+                else:
+                    pad = need - have
+                    z0 = torch.nn.functional.pad(z0, (0, pad))  # right-pad
+                    target_latents = torch.nn.functional.pad(target_latents, (0, pad))
+
         for i, t in tqdm(enumerate(timesteps), total=num_inference_steps):
 
             if is_repaint:
@@ -1343,7 +1364,7 @@ class ACEStepPipeline:
                 )
             if to_left_pad_gt_latents is not None:
                 target_latents = torch.cat(
-                    [to_right_pad_gt_latents, target_latents], dim=0
+                    [to_left_pad_gt_latents, target_latents], dim=-1
                 )
         return target_latents
 
@@ -1475,7 +1496,7 @@ class ACEStepPipeline:
 
         start_time = time.time()
 
-        if audio2audio_enable and ref_audio_input is not None:
+        if task == "audio2audio" and audio2audio_enable and ref_audio_input is not None:
             task = "audio2audio"
 
         if not self.loaded:
