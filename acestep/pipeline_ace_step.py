@@ -1126,8 +1126,13 @@ class ACEStepPipeline:
 
                 left_seed = None
                 right_seed = None
+                
+                # Optional warning for style method without reference
+                if extend_bootstrap_method == "style" and ref_latents is None:
+                    logger.warning("extend_bootstrap_method='style' but no reference audio provided; falling back to noise bootstrap.")
+                
                 # Helper to run latent a2a/style bootstrap on a tiled edge chunk
-                def _bootstrap_from_tile(tile_like, want_len):
+                def _bootstrap_from_tile(tile_like, want_len, side: str):
                     """
                     Returns a2a/style bootstrapped latent the same shape as 'tile_like[..., :want_len]'.
                     Uses add_latents_noise with sigma_max=(1-strength).
@@ -1140,12 +1145,11 @@ class ACEStepPipeline:
                     ref_like = tile_like[..., :want_len]
                     if extend_bootstrap_method == "style" and (ref_latents is not None):
                         # take a similarly sized chunk from ref_latents tail/head
-                        # fall back to tile_like if shapes mismatch
                         try:
-                            if tile_like is right_edge_tiled:
-                                ref_like = ref_latents[..., -want_len:]
-                            else:
-                                ref_like = ref_latents[..., :want_len]
+                            ref_like = (
+                                ref_latents[..., -want_len:] if side == "right"
+                                else ref_latents[..., :want_len]
+                            )
                         except Exception:
                             ref_like = tile_like[..., :want_len]
                     # Run a2a-style latent mixing
@@ -1171,7 +1175,7 @@ class ACEStepPipeline:
                     # optional: bootstrap from edge context via a2a/style
                     if extend_bootstrap:
                         try:
-                            boot = _bootstrap_from_tile(left_edge_tiled, left_pad)
+                            boot = _bootstrap_from_tile(left_edge_tiled, left_pad, side="left")
                             base_seed = boot
                         except Exception as _:
                             pass  # fall back to noise if anything fails
@@ -1187,7 +1191,7 @@ class ACEStepPipeline:
                     base_seed = right_noise
                     if extend_bootstrap:
                         try:
-                            boot = _bootstrap_from_tile(right_edge_tiled, right_pad)
+                            boot = _bootstrap_from_tile(right_edge_tiled, right_pad, side="right")
                             base_seed = boot
                         except Exception as _:
                             pass
@@ -1776,7 +1780,7 @@ class ACEStepPipeline:
             src_latents = self.infer_latents(src_audio_path)
         
         ref_latents = None
-        if ref_audio_input is not None and audio2audio_enable:
+        if ref_audio_input is not None:
             assert ref_audio_input is not None, "ref_audio_input is required for audio2audio task"
             assert os.path.exists(
                 ref_audio_input

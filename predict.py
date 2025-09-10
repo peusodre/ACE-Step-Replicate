@@ -394,7 +394,12 @@ class Predictor(BasePredictor):
             "audio2audio_enable": (task in ("audio2audio", "style_transfer")) and (canonical_task == "text2music"),
             "ref_audio_input": (
                 input_audio_path if task == "audio2audio"
-                else (reference_audio_path if task == "style_transfer" else None)
+                else (
+                    reference_audio_path
+                    if (task == "style_transfer"
+                        or (canonical_task == "extend" and extend_bootstrap_method == "style" and reference_audio_path))
+                    else None
+                )
             ),
             "ref_audio_strength": (
                 float(1.0 - audio2audio_strength) if task == "audio2audio"
