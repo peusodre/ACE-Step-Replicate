@@ -951,6 +951,10 @@ class ACEStepPipeline:
             repaint_start_frame = sec_to_frames(repaint_start)
             repaint_end_frame = sec_to_frames(repaint_end)
             
+            # Log extend/repaint setup details
+            logger.info(f"repaint_start={repaint_start}, repaint_end={repaint_end}")
+            logger.info(f"src_len_frames={src_latents.shape[-1] if src_latents is not None else None}, frame_length={frame_length}")
+            
             # Clamp to actual src length and guarantee ordering
             src_len = src_latents.shape[-1]
             repaint_start_frame = max(-src_len, min(repaint_start_frame, src_len))
@@ -1498,6 +1502,9 @@ class ACEStepPipeline:
 
         if task == "audio2audio" and audio2audio_enable and ref_audio_input is not None:
             task = "audio2audio"
+
+        # Sanity log to see effective task
+        logger.info(f"EFFECTIVE TASK: {task}  (a2a_enable={audio2audio_enable}, ref_audio_input={'yes' if ref_audio_input else 'no'})")
 
         if not self.loaded:
             logger.warning("Checkpoint not loaded, loading checkpoint...")

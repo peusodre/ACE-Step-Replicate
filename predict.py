@@ -296,6 +296,14 @@ class Predictor(BasePredictor):
         }
 
         if canonical_task == "extend":
+            # Cap overrun check
+            def sec_to_frames(sec: float) -> int:
+                return int(round(sec * 44100.0 / 512.0 / 8.0))
+            want = sec_to_frames(actual_audio_duration + 2.0 * float(extend_duration))
+            cap = sec_to_frames(240.0)
+            if want > cap:
+                raise ValueError(f"Extend exceeds cap: want={want} frames ({actual_audio_duration + 2.0 * float(extend_duration):.1f}s), cap={cap} frames (240.0s). Try smaller extend_duration.")
+            
             task_kwargs.update({
                 "src_audio_path": input_audio_path,
                 "repaint_start": -float(extend_duration),
@@ -344,8 +352,9 @@ class Predictor(BasePredictor):
             "repaint_end": task_kwargs.get("repaint_end", 0.0),
 
             "audio2audio_enable": (task == "audio2audio"),
-            "ref_audio_input": input_audio_path if task == "audio2audio" else (
-                reference_audio_path if task == "style_transfer" else None
+            "ref_audio_input": (
+                input_audio_path if task == "audio2audio"
+                else (reference_audio_path if task == "style_transfer" else None)
             ),
             "ref_audio_strength": (
                 float(1.0 - audio2audio_strength) if task == "audio2audio"
