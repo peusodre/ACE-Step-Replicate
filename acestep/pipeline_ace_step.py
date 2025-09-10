@@ -842,6 +842,7 @@ class ACEStepPipeline:
         audio2audio_enable=False,
         ref_audio_strength=0.5,
         ref_latents=None,
+        extend_strength=0.7,
     ):
 
         logger.info(
@@ -998,79 +999,80 @@ class ACEStepPipeline:
                 to_right_pad_gt_latents = None
                 to_left_pad_gt_latents = None
                 gt_latents = src_latents
-                src_latents_length = gt_latents.shape[-1]
+                src_len = gt_latents.shape[-1]
                 max_infer_fame_length = int(240 * 44100 / 512 / 8)
-                left_pad_frame_length = 0
-                right_pad_frame_length = 0
-                right_trim_length = 0
-                left_trim_length = 0
-                if repaint_start_frame < 0:
-                    left_pad_frame_length = abs(repaint_start_frame)
-                    frame_length = left_pad_frame_length + gt_latents.shape[-1]
-                    extend_gt_latents = torch.nn.functional.pad(
-                        gt_latents, (left_pad_frame_length, 0), "constant", 0
-                    )
-                    if frame_length > max_infer_fame_length:
-                        right_trim_length = frame_length - max_infer_fame_length
-                        extend_gt_latents = extend_gt_latents[
-                            :, :, :, :max_infer_fame_length
-                        ]
-                        to_right_pad_gt_latents = extend_gt_latents[
-                            :, :, :, -right_trim_length:
-                        ]
-                        frame_length = max_infer_fame_length
-                    repaint_start_frame = 0
-                    gt_latents = extend_gt_latents
-
-                if repaint_end_frame > src_latents_length:
-                    right_pad_frame_length = repaint_end_frame - gt_latents.shape[-1]
-                    frame_length = gt_latents.shape[-1] + right_pad_frame_length
-                    extend_gt_latents = torch.nn.functional.pad(
-                        gt_latents, (0, right_pad_frame_length), "constant", 0
-                    )
-                    if frame_length > max_infer_fame_length:
-                        left_trim_length = frame_length - max_infer_fame_length
-                        extend_gt_latents = extend_gt_latents[
-                            :, :, :, -max_infer_fame_length:
-                        ]
-                        to_left_pad_gt_latents = extend_gt_latents[
-                            :, :, :, :left_trim_length
-                        ]
-                        frame_length = max_infer_fame_length
-                    repaint_end_frame = frame_length
-                    gt_latents = extend_gt_latents
-
+                
+                # Compute both pads from original length BEFORE any padding
+                target_start_f = repaint_start_frame  # negative for extend-left
+                target_end_f = repaint_end_frame     # > src_len for extend-right
+                
+                left_pad = max(0, -target_start_f)           # how many frames to pad on the left
+                right_pad = max(0, target_end_f - src_len)   # how many frames to pad on the right
+                new_len = src_len + left_pad + right_pad
+                
+                # Cap handling: crop to model limit
+                left_trim = right_trim = 0
+                if new_len > max_infer_fame_length:
+                    overflow = new_len - max_infer_fame_length
+                    # Prefer trimming evenly; bias to the bigger side
+                    take_left = min(left_pad, overflow // 2 + overflow % 2)
+                    take_right = min(right_pad, overflow - take_left)
+                    left_trim, right_trim = take_left, take_right
+                    left_pad -= take_left
+                    right_pad -= take_right
+                    new_len = max_infer_fame_length
+                
+                # Now pad both sides in one shot (time axis is last dim)
+                if left_pad or right_pad:
+                    gt_latents = torch.nn.functional.pad(gt_latents, (left_pad, right_pad), "constant", 0)
+                
+                # Update frame_length and repaint frames
+                frame_length = new_len
+                repaint_start_frame = left_pad  # start after left padding
+                repaint_end_frame = left_pad + src_len  # end before right padding
+                
                 # Debug log for extend padding
-                logger.info(f"[EXTEND] left_pad={left_pad_frame_length}  right_pad={right_pad_frame_length}  "
-                           f"left_trim={left_trim_length}  right_trim={right_trim_length}")
+                logger.info(f"[EXTEND] left_pad={left_pad}  right_pad={right_pad}  left_trim={left_trim}  right_trim={right_trim}  new_len={new_len}")
 
-                repaint_mask = torch.zeros(
-                    (bsz, 8, 16, frame_length), device=self.device, dtype=self.dtype
-                )
-                if left_pad_frame_length > 0:
-                    repaint_mask[:, :, :, :left_pad_frame_length] = 1.0
-                if right_pad_frame_length > 0:
-                    repaint_mask[:, :, :, -right_pad_frame_length:] = 1.0
-                x0 = gt_latents
-                padd_list = []
-                if left_pad_frame_length > 0:
-                    padd_list.append(retake_latents[:, :, :, :left_pad_frame_length])
-                padd_list.append(
-                    target_latents[
-                        :,
-                        :,
-                        :,
-                        left_trim_length: target_latents.shape[-1] - right_trim_length,
-                    ]
-                )
-                if right_pad_frame_length > 0:
-                    padd_list.append(retake_latents[:, :, :, -right_pad_frame_length:])
-                target_latents = torch.cat(padd_list, dim=-1)
-                assert (
-                    target_latents.shape[-1] == x0.shape[-1]
-                ), f"{target_latents.shape=} {x0.shape=}"
+                # Build repaint mask in the padded space
+                repaint_mask = torch.zeros_like(gt_latents)
+                if left_pad > 0:
+                    repaint_mask[..., :left_pad] = 1.0
+                if right_pad > 0:
+                    repaint_mask[..., -right_pad:] = 1.0
+                x0 = gt_latents  # reference for blending and zt_src construction
+                
+                # Edge-guided seeding for better quality
+                EDGE = min(128, x0.shape[-1])  # ~1s of latent context
+                theta = torch.tensor(max(0.1, min(0.9, extend_strength)), device=self.device, dtype=self.dtype)
+                noise_mix = 1.0 - theta
+                
+                def _tile_edge(edge_chunk, need):
+                    reps = (need + edge_chunk.shape[-1] - 1) // edge_chunk.shape[-1]
+                    return edge_chunk.repeat(1,1,1,reps)[...,:need]
+                
+                left_seed = None
+                right_seed = None
+                
+                if left_pad > 0:
+                    left_edge = x0[..., :EDGE].flip(-1)  # mirror the beginning
+                    left_seed = theta * _tile_edge(left_edge, left_pad) + noise_mix * retake_latents[..., :left_pad]
+                
+                if right_pad > 0:
+                    right_edge = x0[..., -EDGE:]  # take the end as-is
+                    right_seed = theta * _tile_edge(right_edge, right_pad) + noise_mix * retake_latents[..., -right_pad:]
+                
+                # Assemble z0 (initial noisy latents) with both seeds
+                mid = target_latents[..., left_trim: target_latents.shape[-1] - right_trim]  # keep same center noise
+                
+                parts = []
+                if left_pad > 0:  parts.append(left_seed)
+                parts.append(mid)
+                if right_pad > 0: parts.append(right_seed)
+                
+                z0 = torch.cat(parts, dim=-1)
+                target_latents = z0.clone()  # keep them aligned
                 zt_edit = x0.clone()
-                z0 = target_latents
                 
                 # Debug log for extend shapes
                 logger.info(f"[EXTEND] x0.shape={x0.shape}  z0.shape={z0.shape}  target_latents.shape={target_latents.shape}")
@@ -1370,14 +1372,11 @@ class ACEStepPipeline:
                 )[0]
 
         if is_extend:
-            if to_right_pad_gt_latents is not None:
-                target_latents = torch.cat(
-                    [target_latents, to_right_pad_gt_latents], dim=-1
-                )
-            if to_left_pad_gt_latents is not None:
-                target_latents = torch.cat(
-                    [to_left_pad_gt_latents, target_latents], dim=-1
-                )
+            # End-of-pass re-append (only if you trimmed for the cap)
+            if left_trim > 0:
+                target_latents = torch.cat([to_left_pad_gt_latents, target_latents], dim=-1)
+            if right_trim > 0:
+                target_latents = torch.cat([target_latents, to_right_pad_gt_latents], dim=-1)
             # Debug log after re-append
             logger.info(f"[EXTEND] after re-append: target_latents.shape={target_latents.shape}")
         return target_latents
@@ -1506,6 +1505,7 @@ class ACEStepPipeline:
         save_path: str = None,
         batch_size: int = 1,
         debug: bool = False,
+        extend_strength: float = 0.7,
     ):
 
         start_time = time.time()
@@ -1694,6 +1694,7 @@ class ACEStepPipeline:
                 audio2audio_enable=audio2audio_enable,
                 ref_audio_strength=ref_audio_strength,
                 ref_latents=ref_latents,
+                extend_strength=extend_strength,
             )
 
         end_time = time.time()
