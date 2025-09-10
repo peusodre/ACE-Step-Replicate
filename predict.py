@@ -310,6 +310,14 @@ class Predictor(BasePredictor):
                 "repaint_end": actual_audio_duration + float(extend_duration),
             })
             audio_duration_out = actual_audio_duration + 2.0 * float(extend_duration)
+            
+            # Extend-specific presets for better quality
+            guidance_scale = 20.0
+            guidance_interval = 0.6
+            min_guidance_scale = 6.0
+            cfg_type = "apg"
+            use_erg_diffusion = False
+            use_erg_lyric = False
         elif canonical_task == "repaint":
             task_kwargs.update({
                 "src_audio_path": input_audio_path,
@@ -366,7 +374,9 @@ class Predictor(BasePredictor):
             "retake_seeds": retake_seeds,
             "retake_variance": (
                 float(repaint_strength) if canonical_task == "repaint"
-                else float(variation_strength)
+                else (float(variation_strength) if variation_strength and variation_strength > 0
+                      else (max(0.15, min(0.4, 1.0 - 0.8 * float(extend_strength))) if canonical_task == "extend"
+                            else float(variation_strength)))
             ),
 
             "lora_name_or_path": lora_name_or_path,

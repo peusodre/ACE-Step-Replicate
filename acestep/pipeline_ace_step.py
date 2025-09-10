@@ -937,6 +937,8 @@ class ACEStepPipeline:
 
         if add_retake_noise:
             n_min = int(infer_steps * (1 - retake_variance))
+            # ensure the '== n_min' branch is reachable
+            n_min = max(1, min(n_min, infer_steps - 1))
             retake_variance = (
                 torch.tensor(retake_variance * math.pi / 2).to(self.device).to(self.dtype)
             )
