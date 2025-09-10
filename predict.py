@@ -32,7 +32,7 @@ def canonicalize_task(user_task: str) -> str:
     if user_task == "repaint":
         return "repaint"
     if user_task == "style_transfer":
-        return "edit"          # edit an existing clip
+        return "text2music"   # <-- was "edit"
     if user_task == "audio2audio":
         return "text2music"    # uses ref_audio_input under the hood
     return "text2music"
@@ -225,12 +225,15 @@ class Predictor(BasePredictor):
             default=0.5, ge=0.0, le=1.0,
         ),
 
-        # ---- Diffusion / guidance --------------------------------------------
-        infer_steps: int = Input(default=60, ge=20, le=100),
-        guidance_scale: float = Input(default=15.0, ge=1.0, le=30.0),
-        scheduler_type: str = Input(default="euler", choices=["euler", "heun", "pingpong"]),
-        cfg_type: str = Input(default="apg", choices=["apg", "cfg", "cfg_star"]),
-        omega_scale: float = Input(default=10.0, ge=1.0, le=20.0),
+    # ---- Diffusion / guidance --------------------------------------------
+    infer_steps: int = Input(default=60, ge=20, le=100),
+    guidance_scale: float = Input(default=15.0, ge=1.0, le=30.0),
+    scheduler_type: str = Input(default="euler", choices=["euler", "heun", "pingpong"]),
+    cfg_type: str = Input(default="apg", choices=["apg", "cfg", "cfg_star"]),
+    omega_scale: float = Input(default=10.0, ge=1.0, le=20.0),
+    guidance_interval: float = Input(default=0.5, ge=0.0, le=1.0),
+    guidance_interval_decay: float = Input(default=0.0, ge=0.0, le=5.0),
+    min_guidance_scale: float = Input(default=3.0, ge=0.0, le=30.0),
         use_erg_tag: bool = Input(default=True),
         use_erg_lyric: bool = Input(default=True),
         use_erg_diffusion: bool = Input(default=True),
@@ -274,8 +277,8 @@ class Predictor(BasePredictor):
         )
 
         # Compose prompt/lyrics
-        final_prompt = style_prompt if canonical_task == "edit" and style_prompt else prompt
-        final_lyrics = style_lyrics if canonical_task == "edit" and style_lyrics else lyrics
+        final_prompt = style_prompt if task == "style_transfer" and style_prompt else prompt
+        final_lyrics = style_lyrics if task == "style_transfer" and style_lyrics else lyrics
 
         # Seeds
         manual_seeds = [seed] if seed is not None else None
@@ -284,8 +287,14 @@ class Predictor(BasePredictor):
         # Duration (for tasks that depend on src audio)
         actual_audio_duration = audio_duration
         if input_audio_path and canonical_task in ("extend", "repaint", "edit"):
-            import librosa
-            actual_audio_duration = float(librosa.get_duration(path=input_audio_path))
+            try:
+                import librosa
+                actual_audio_duration = float(librosa.get_duration(path=input_audio_path))
+            except Exception:
+                # fallback using torchaudio
+                import torchaudio
+                info = torchaudio.info(input_audio_path)
+                actual_audio_duration = info.num_frames / float(info.sample_rate)
 
         # Task specifics
         task_kwargs = {
@@ -297,8 +306,9 @@ class Predictor(BasePredictor):
 
         if canonical_task == "extend":
             # Cap overrun check
+            fps = float(sample_rate) / (512.0 * 8.0)
             def sec_to_frames(sec: float) -> int:
-                return int(round(sec * 44100.0 / 512.0 / 8.0))
+                return int(round(sec * fps))
             want = sec_to_frames(actual_audio_duration + 2.0 * float(extend_duration))
             cap = sec_to_frames(240.0)
             if want > cap:
@@ -345,9 +355,10 @@ class Predictor(BasePredictor):
             "cfg_type": cfg_type,
             "omega_scale": float(omega_scale),
             "manual_seeds": manual_seeds,
-            "guidance_interval": 0.5,
+            # use the possibly-updated values
+            "guidance_interval": float(guidance_interval),
             "guidance_interval_decay": 0.0,
-            "min_guidance_scale": 3.0,
+            "min_guidance_scale": float(min_guidance_scale),
             "use_erg_tag": bool(use_erg_tag),
             "use_erg_lyric": bool(use_erg_lyric),
             "use_erg_diffusion": bool(use_erg_diffusion),
@@ -359,15 +370,14 @@ class Predictor(BasePredictor):
             "repaint_start": task_kwargs.get("repaint_start", 0.0),
             "repaint_end": task_kwargs.get("repaint_end", 0.0),
 
-            "audio2audio_enable": (task == "audio2audio"),
+            "audio2audio_enable": (task in ("audio2audio", "style_transfer")) and (canonical_task == "text2music"),
             "ref_audio_input": (
                 input_audio_path if task == "audio2audio"
                 else (reference_audio_path if task == "style_transfer" else None)
             ),
             "ref_audio_strength": (
                 float(1.0 - audio2audio_strength) if task == "audio2audio"
-                else float(extend_strength) if task == "extend"
-                else 0.3 if task == "style_transfer" and reference_audio_path
+                else float(1.0 - style_strength) if task == "style_transfer"
                 else 0.5
             ),
 
@@ -385,6 +395,8 @@ class Predictor(BasePredictor):
             "batch_size": 1,
             "debug": False,
             "oss_steps": [],
+            "extend_strength": float(extend_strength),  # pass it through
+            "sample_rate": int(sample_rate),  # pass sample rate through
         }
 
         if pipeline_params["src_audio_path"]:

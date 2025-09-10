@@ -85,6 +85,12 @@ def ensure_directory_exists(directory):
     if not os.path.exists(directory):
         os.makedirs(directory)
 
+def _frames_per_second(sample_rate: int) -> float:
+    """Calculate frames per second for the latent space."""
+    HOP = 512
+    RATIO = 8
+    return float(sample_rate) / (HOP * RATIO)
+
 
 REPO_ID = "ACE-Step/ACE-Step-v1-3.5B"
 REPO_ID_QUANT = REPO_ID + "-q4-K-M" # ??? update this i guess
@@ -592,10 +598,14 @@ class ACEStepPipeline:
         target_guidance_scale = guidance_scale
         bsz = encoder_text_hidden_states.shape[0]
 
-        scheduler = FlowMatchEulerDiscreteScheduler(
-            num_train_timesteps=1000,
-            shift=3.0,
-        )
+        if scheduler_type == "euler":
+            scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000, shift=3.0)
+        elif scheduler_type == "heun":
+            scheduler = FlowMatchHeunDiscreteScheduler(num_train_timesteps=1000, shift=3.0)
+        elif scheduler_type == "pingpong":
+            scheduler = FlowMatchPingPongScheduler(num_train_timesteps=1000, shift=3.0)
+        else:
+            raise ValueError(f"Unknown scheduler_type: {scheduler_type}")
 
         T_steps = infer_steps
         frame_length = src_latents.shape[-1]
@@ -843,6 +853,7 @@ class ACEStepPipeline:
         ref_audio_strength=0.5,
         ref_latents=None,
         extend_strength=0.7,
+        sample_rate=48000,
     ):
 
         logger.info(
@@ -888,7 +899,8 @@ class ACEStepPipeline:
                 shift=3.0,
             )
 
-        frame_length = int(duration * 44100 / 512 / 8)
+        fps = _frames_per_second(sample_rate)
+        frame_length = int(duration * fps)
         if src_latents is not None:
             frame_length = src_latents.shape[-1]
         
@@ -897,7 +909,6 @@ class ACEStepPipeline:
 
         if len(oss_steps) > 0:
             infer_steps = max(oss_steps)
-            scheduler.set_timesteps
             timesteps, num_inference_steps = retrieve_timesteps(
                 scheduler,
                 num_inference_steps=infer_steps,
@@ -950,7 +961,7 @@ class ACEStepPipeline:
                 dtype=self.dtype,
             )
             def sec_to_frames(sec: float) -> int:
-                return int(round(sec * 44100.0 / 512.0 / 8.0))
+                return int(round(sec * fps))
             repaint_start_frame = sec_to_frames(repaint_start)
             repaint_end_frame = sec_to_frames(repaint_end)
             
@@ -958,13 +969,25 @@ class ACEStepPipeline:
             logger.info(f"repaint_start={repaint_start}, repaint_end={repaint_end}")
             logger.info(f"src_len_frames={src_latents.shape[-1] if src_latents is not None else None}, frame_length={frame_length}")
             
+        # Only if we're repainting/retaking/extending (i.e., add_retake_noise) AND we have src_latents
+        if add_retake_noise and (src_latents is not None):
             # Clamp to actual src length and guarantee ordering
             src_len = src_latents.shape[-1]
-            repaint_start_frame = max(-src_len, min(repaint_start_frame, src_len))
-            repaint_end_frame = max(0, min(repaint_end_frame, src_len))
+            
+            if not ((repaint_start < 0) or (repaint_end > src_len / fps)):
+                # repaint-only behavior: clamp to within the clip
+                repaint_start_frame = max(0, min(repaint_start_frame, src_len))
+                repaint_end_frame = max(0, min(repaint_end_frame, src_len))
+            else:
+                # extend behavior: allow overshoot on the right and negative on the left
+                repaint_start_frame = max(-src_len, repaint_start_frame)  # allow negative
+                # DO NOT clamp repaint_end_frame to src_len here
+                repaint_end_frame = max(0, repaint_end_frame)  # only ensure non-negative
+            
             if repaint_end_frame < repaint_start_frame:
                 repaint_end_frame = repaint_start_frame
-            
+
+            # ↓↓↓ DEDENT everything from here ↓↓↓
             x0 = src_latents
             # retake
             is_repaint = repaint_end_frame - repaint_start_frame != frame_length
@@ -1000,8 +1023,8 @@ class ACEStepPipeline:
                 to_left_pad_gt_latents = None
                 gt_latents = src_latents
                 src_len = gt_latents.shape[-1]
-                max_infer_fame_length = int(240 * 44100 / 512 / 8)
-                
+                max_infer_fame_length = int(240 * fps)
+            
                 # Compute both pads from original length BEFORE any padding
                 target_start_f = repaint_start_frame  # negative for extend-left
                 target_end_f = repaint_end_frame     # > src_len for extend-right
@@ -1210,20 +1233,23 @@ class ACEStepPipeline:
             return sample
 
         # Final shape guard: ensure z0 and target_latents match x0 along last dim
-        if is_repaint:
+        # Only run if we're in repaint/extend mode and have the required variables
+        if add_retake_noise and (src_latents is not None) and is_repaint:
             need = x0.shape[-1]
-            for name in ("z0", "target_latents"):
-                t = locals()[name]
-                have = t.shape[-1]
-                if have > need:
-                    t = t[..., :need]
-                elif have < need:
-                    t = torch.nn.functional.pad(t, (0, need - have))
-                locals()[name] = t
+
+            if z0.shape[-1] > need:
+                z0 = z0[..., :need]
+            elif z0.shape[-1] < need:
+                z0 = torch.nn.functional.pad(z0, (0, need - z0.shape[-1]))
+
+            if target_latents.shape[-1] > need:
+                target_latents = target_latents[..., :need]
+            elif target_latents.shape[-1] < need:
+                target_latents = torch.nn.functional.pad(target_latents, (0, need - target_latents.shape[-1]))
 
         for i, t in tqdm(enumerate(timesteps), total=num_inference_steps):
 
-            if is_repaint:
+            if add_retake_noise and (src_latents is not None) and is_repaint:
                 if i < n_min:
                     continue
                 elif i == n_min:
@@ -1371,14 +1397,8 @@ class ACEStepPipeline:
                     generator=random_generators[0],
                 )[0]
 
-        if is_extend:
-            # End-of-pass re-append (only if you trimmed for the cap)
-            if left_trim > 0:
-                target_latents = torch.cat([to_left_pad_gt_latents, target_latents], dim=-1)
-            if right_trim > 0:
-                target_latents = torch.cat([target_latents, to_right_pad_gt_latents], dim=-1)
-            # Debug log after re-append
-            logger.info(f"[EXTEND] after re-append: target_latents.shape={target_latents.shape}")
+        # Note: Re-append code removed - we already trimmed by reducing left_pad/right_pad
+        # so there's nothing left to re-append
         return target_latents
 
     @cpu_offload("music_dcae")
@@ -1421,7 +1441,9 @@ class ACEStepPipeline:
                 f"{base_path}/output_{time.strftime('%Y%m%d%H%M%S')}_{idx}."+format
             )
         else:
-            ensure_directory_exists(os.path.dirname(save_path))
+            dirpart = os.path.dirname(save_path)
+            if dirpart:
+                ensure_directory_exists(dirpart)
             if os.path.isdir(save_path):
                 logger.info(f"Provided save_path '{save_path}' is a directory. Appending timestamped filename.")
                 output_path_wav = os.path.join(save_path, f"output_{time.strftime('%Y%m%d%H%M%S')}_{idx}."+format)
@@ -1506,12 +1528,11 @@ class ACEStepPipeline:
         batch_size: int = 1,
         debug: bool = False,
         extend_strength: float = 0.7,
+        sample_rate: int = 48000,
     ):
 
         start_time = time.time()
 
-        if task == "audio2audio" and audio2audio_enable and ref_audio_input is not None:
-            task = "audio2audio"
 
         # Sanity log to see effective task
         logger.info(f"EFFECTIVE TASK: {task}  (a2a_enable={audio2audio_enable}, ref_audio_input={'yes' if ref_audio_input else 'no'})")
@@ -1695,6 +1716,7 @@ class ACEStepPipeline:
                 ref_audio_strength=ref_audio_strength,
                 ref_latents=ref_latents,
                 extend_strength=extend_strength,
+                sample_rate=sample_rate,
             )
 
         end_time = time.time()
@@ -1703,9 +1725,10 @@ class ACEStepPipeline:
 
         output_paths = self.latents2audio(
             latents=target_latents,
-            target_wav_duration_second=audio_duration,
+            target_wav_duration_second=audio_duration,  # use the value passed in
             save_path=save_path,
             format=format,
+            sample_rate=sample_rate,
         )
 
         # Clean up memory after generation
