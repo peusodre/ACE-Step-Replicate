@@ -226,6 +226,10 @@ class Predictor(BasePredictor):
             default="boot_only",  # <-- default to what you want now
             choices=["boot_only", "boot_plus_noise"],
         ),
+        extend_tile_only: bool = Input(
+            description="Extend by tiling only (no diffusion/inpainting). For diagnostics.",
+            default=False,
+        ),
 
         # ---- Style transfer (edit) -------------------------------------------
         style_prompt: str = Input(
@@ -434,6 +438,7 @@ class Predictor(BasePredictor):
             "extend_bootstrap_strength": float(extend_bootstrap_strength),
             "seam_seconds": float(seam_seconds),
             "extend_pad_mode": str(extend_pad_mode),
+            "extend_tile_only": bool(extend_tile_only),
         }
 
         if pipeline_params["src_audio_path"]:

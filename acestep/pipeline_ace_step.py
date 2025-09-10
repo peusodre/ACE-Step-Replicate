@@ -860,6 +860,7 @@ class ACEStepPipeline:
         extend_bootstrap_strength=0.6,
         seam_seconds=0.75,
         extend_pad_mode="boot_only",
+        extend_tile_only=False,
     ):
 
         logger.info(
@@ -1108,6 +1109,66 @@ class ACEStepPipeline:
                 
                 logger.info(f"[DBG] is_extend={is_extend}  extend_bootstrap={extend_bootstrap}  method={extend_bootstrap_method}  pad_mode={extend_pad_mode}")
                 logger.info(f"[DBG] trims: left_trim={left_trim} right_trim={right_trim}  mid_len(before concat)={target_latents.shape[-1] - left_trim - right_trim}")
+
+                # === TILE-ONLY FAST PATH (no diffusion, no repaint) ===
+                if is_extend and extend_tile_only:
+                    # Helper utilities reused from your code:
+                    def _tile_edge(edge_chunk, need):
+                        reps = (need + edge_chunk.shape[-1] - 1) // edge_chunk.shape[-1]
+                        return edge_chunk.repeat(1, 1, 1, reps)[..., :need]
+
+                    def _smooth_time(x, k=5):
+                        B, C, H, T = x.shape
+                        x_ = x.to(torch.float32).view(B * C, H, T)
+                        x_ = torch.nn.functional.avg_pool1d(x_, kernel_size=k, stride=1, padding=k // 2)
+                        return x_.to(x.dtype).view(B, C, H, T)
+
+                    def _match_stats(z, ref, eps=1e-6):
+                        m_ref = ref.mean(dim=(1, 2, 3), keepdim=True)
+                        s_ref = ref.std(dim=(1, 2, 3), keepdim=True) + eps
+                        m_z = z.mean(dim=(1, 2, 3), keepdim=True)
+                        s_z = z.std(dim=(1, 2, 3), keepdim=True) + eps
+                        return (z - m_z) * (s_ref / s_z) + m_ref
+
+                    # Build tiles purely from the (padded) edges of x0
+                    # Use the same EDGE as your current code, or bump if you want longer context
+                    EDGE = int(min(max(128, x0.shape[-1] // 8), max(128, int(3.0 * fps))))
+                    EDGE = max(128, EDGE)
+
+                    left_tile = None
+                    right_tile = None
+                    if left_pad > 0:
+                        # OPTION A: mirror the head for continuity
+                        left_edge = _smooth_time(x0[..., :EDGE].flip(-1), k=5)
+                        left_tile = _tile_edge(left_edge, left_pad)
+                        # OPTION B (alternative): use the head as-is
+                        # left_edge = _smooth_time(x0[..., :EDGE], k=5)
+
+                    if right_pad > 0:
+                        right_edge = _smooth_time(x0[..., -EDGE:], k=5)
+                        right_tile = _tile_edge(right_edge, right_pad)
+
+                    parts = []
+                    if left_tile is not None:
+                        parts.append(left_tile)
+                    # The middle is the original (padded) source region
+                    mid_start = left_pad if left_pad > 0 else 0
+                    mid_end = x0.shape[-1] - (right_pad if right_pad > 0 else 0)
+                    parts.append(x0[..., mid_start:mid_end])
+                    if right_tile is not None:
+                        parts.append(right_tile)
+
+                    tiled_latents = torch.cat(parts, dim=-1)
+
+                    # Match global stats to x0 so decoder distribution stays sane
+                    tiled_latents = _match_stats(tiled_latents, x0)
+
+                    logger.info("[TILE-ONLY] returning concatenated tiles without diffusion/inpainting. "
+                                f"shape={tuple(tiled_latents.shape)} "
+                                f"left_pad={left_pad} right_pad={right_pad} EDGE={EDGE}")
+
+                    return tiled_latents
+                # === END TILE-ONLY FAST PATH ===
 
                 # Build repaint mask in the padded space
                 repaint_mask = torch.zeros_like(gt_latents)
@@ -1763,6 +1824,7 @@ class ACEStepPipeline:
         extend_bootstrap_strength: float = 0.6,
         seam_seconds: float = 0.75,
         extend_pad_mode: str = "boot_only",
+        extend_tile_only: bool = False,   # <--- NEW
     ):
 
         start_time = time.time()
@@ -1955,6 +2017,7 @@ class ACEStepPipeline:
                 extend_bootstrap_strength=extend_bootstrap_strength,
                 seam_seconds=seam_seconds,
                 extend_pad_mode=extend_pad_mode,
+                extend_tile_only=extend_tile_only,
             )
 
         end_time = time.time()
