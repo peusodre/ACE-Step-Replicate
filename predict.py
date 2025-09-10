@@ -306,7 +306,8 @@ class Predictor(BasePredictor):
 
         if canonical_task == "extend":
             # Cap overrun check
-            fps = float(sample_rate) / (512.0 * 8.0)
+            # fps must reflect MusicDCAE native rate when extending a real clip
+            fps = float(44100) / (512.0 * 8.0)  # 44.1k native
             def sec_to_frames(sec: float) -> int:
                 return int(round(sec * fps))
             want = sec_to_frames(actual_audio_duration + 2.0 * float(extend_duration))
@@ -357,7 +358,7 @@ class Predictor(BasePredictor):
             "manual_seeds": manual_seeds,
             # use the possibly-updated values
             "guidance_interval": float(guidance_interval),
-            "guidance_interval_decay": 0.0,
+            "guidance_interval_decay": float(guidance_interval_decay),
             "min_guidance_scale": float(min_guidance_scale),
             "use_erg_tag": bool(use_erg_tag),
             "use_erg_lyric": bool(use_erg_lyric),

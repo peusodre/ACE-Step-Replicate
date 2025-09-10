@@ -899,7 +899,17 @@ class ACEStepPipeline:
                 shift=3.0,
             )
 
-        fps = _frames_per_second(sample_rate)
+        # Use the correct sample rate for frame calculations
+        # If we have source latents, use 44.1kHz (MusicDCAE's native rate)
+        # Otherwise use the user-provided sample_rate
+        if src_latents is not None:
+            # Use MusicDCAE's native sample rate (44.1kHz) for frame calculations
+            fps = _frames_per_second(44100)
+            logger.info(f"Using 44.1kHz for frame calculations (MusicDCAE native rate): fps={fps:.6f}")
+        else:
+            fps = _frames_per_second(sample_rate)
+            logger.info(f"Using {sample_rate}Hz for frame calculations: fps={fps:.6f}")
+            
         frame_length = int(duration * fps)
         if src_latents is not None:
             frame_length = src_latents.shape[-1]
@@ -1054,8 +1064,9 @@ class ACEStepPipeline:
                 repaint_start_frame = left_pad  # start after left padding
                 repaint_end_frame = left_pad + src_len  # end before right padding
                 
-                # Debug log for extend padding
-                logger.info(f"[EXTEND] left_pad={left_pad}  right_pad={right_pad}  left_trim={left_trim}  right_trim={right_trim}  new_len={new_len}")
+                # Debug log for extend padding with seconds
+                f2s = lambda f: f / fps
+                logger.info(f"[EXTEND] src={src_len}f ({f2s(src_len):.2f}s) left_pad={left_pad}f ({f2s(left_pad):.2f}s) right_pad={right_pad}f ({f2s(right_pad):.2f}s) new_len={frame_length}f ({f2s(frame_length):.2f}s)")
 
                 # Build repaint mask in the padded space
                 repaint_mask = torch.zeros_like(gt_latents)
