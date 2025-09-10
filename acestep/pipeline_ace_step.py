@@ -859,6 +859,7 @@ class ACEStepPipeline:
         extend_bootstrap_method="a2a",
         extend_bootstrap_strength=0.6,
         seam_seconds=0.75,
+        extend_pad_mode="boot_only",
     ):
 
         logger.info(
@@ -1134,33 +1135,40 @@ class ACEStepPipeline:
                 # Helper to run latent a2a/style bootstrap on a tiled edge chunk
                 def _bootstrap_from_tile(tile_like, want_len, side: str):
                     """
-                    Returns a2a/style bootstrapped latent the same shape as 'tile_like[..., :want_len]'.
-                    Uses add_latents_noise with sigma_max=(1-strength).
+                    Returns bootstrapped latent of length want_len using a2a/style in latent space.
+                    If extend_pad_mode == 'boot_only', we do NOT add random noise; we denoise
+                    directly from the reference chunk by setting noise=0 and using sigma_max=(1-strength).
                     """
-                    # Create matching noise slice to drive add_latents_noise
-                    noise_like = retake_latents[..., :want_len]
-                    if noise_like.shape[-1] != want_len:
-                        noise_like = torch.nn.functional.pad(noise_like, (0, want_len - noise_like.shape[-1]))
-                    # Choose reference (style) if requested and available
                     ref_like = tile_like[..., :want_len]
+
+                    # If style mode and a global ref_latents exists, prefer it as the reference
                     if extend_bootstrap_method == "style" and (ref_latents is not None):
-                        # take a similarly sized chunk from ref_latents tail/head
                         try:
+                            # map head/tail roughly; fallback to ref_like on mismatch
                             ref_like = (
                                 ref_latents[..., -want_len:] if side == "right"
                                 else ref_latents[..., :want_len]
                             )
                         except Exception:
                             ref_like = tile_like[..., :want_len]
-                    # Run a2a-style latent mixing
+
+                    # Choose noise source
+                    if extend_pad_mode == "boot_only":
+                        noise_like = torch.zeros_like(ref_like)                      # <-- no random noise
+                        sigma_max = (1.0 - float(extend_bootstrap_strength))         # small sigma => stay close to ref
+                    else:
+                        # legacy: energy-matched noise
+                        noise_like = _match_rms(retake_latents[..., :want_len], ref_like)
+                        sigma_max = (1.0 - float(extend_bootstrap_strength))
+
                     boot, _, _, _ = self.add_latents_noise(
                         gt_latents=ref_like,
-                        sigma_max=(1.0 - float(extend_bootstrap_strength)),
+                        sigma_max=sigma_max,
                         noise=noise_like,
                         scheduler_type=scheduler_type,
                         infer_steps=infer_steps,
                     )
-                    # match RMS back to the edge (prevents hiss)
+                    # match back RMS to reference to avoid hiss
                     return _match_rms(boot, ref_like)
 
                 if left_pad > 0:
@@ -1169,16 +1177,14 @@ class ACEStepPipeline:
                     left_edge_tiled = _tile_edge(left_edge, left_pad)
 
                     theta_vec = _ramp_theta(left_pad, theta_near, theta_far).view(1, 1, 1, -1)
-                    # base: energy-match random to edge
-                    left_noise = _match_rms(retake_latents[..., :left_pad], left_edge_tiled)
-                    base_seed = left_noise
-                    # optional: bootstrap from edge context via a2a/style
+                    # prefer pure bootstrap when 'boot_only'
                     if extend_bootstrap:
                         try:
-                            boot = _bootstrap_from_tile(left_edge_tiled, left_pad, side="left")
-                            base_seed = boot
-                        except Exception as _:
-                            pass  # fall back to noise if anything fails
+                            base_seed = _bootstrap_from_tile(left_edge_tiled, left_pad, side="left")
+                        except Exception:
+                            base_seed = _match_rms(retake_latents[..., :left_pad], left_edge_tiled)
+                    else:
+                        base_seed = _match_rms(retake_latents[..., :left_pad], left_edge_tiled)
                     left_seed = theta_vec * left_edge_tiled + (1.0 - theta_vec) * base_seed
 
                 if right_pad > 0:
@@ -1187,14 +1193,14 @@ class ACEStepPipeline:
                     right_edge_tiled = _tile_edge(right_edge, right_pad)
 
                     theta_vec = _ramp_theta(right_pad, theta_near, theta_far).view(1, 1, 1, -1)
-                    right_noise = _match_rms(retake_latents[..., -right_pad:], right_edge_tiled)
-                    base_seed = right_noise
+                    # prefer pure bootstrap when 'boot_only'
                     if extend_bootstrap:
                         try:
-                            boot = _bootstrap_from_tile(right_edge_tiled, right_pad, side="right")
-                            base_seed = boot
-                        except Exception as _:
-                            pass
+                            base_seed = _bootstrap_from_tile(right_edge_tiled, right_pad, side="right")
+                        except Exception:
+                            base_seed = _match_rms(retake_latents[..., -right_pad:], right_edge_tiled)
+                    else:
+                        base_seed = _match_rms(retake_latents[..., -right_pad:], right_edge_tiled)
                     right_seed = theta_vec * right_edge_tiled + (1.0 - theta_vec) * base_seed
 
                 # Assemble z0 using the original mid-noise (trimmed as before to stay aligned)
@@ -1691,6 +1697,7 @@ class ACEStepPipeline:
         extend_bootstrap_method: str = "a2a",  # "a2a" or "style"
         extend_bootstrap_strength: float = 0.6,
         seam_seconds: float = 0.75,
+        extend_pad_mode: str = "boot_only",
     ):
 
         start_time = time.time()
@@ -1781,7 +1788,6 @@ class ACEStepPipeline:
         
         ref_latents = None
         if ref_audio_input is not None:
-            assert ref_audio_input is not None, "ref_audio_input is required for audio2audio task"
             assert os.path.exists(
                 ref_audio_input
             ), f"ref_audio_input {ref_audio_input} does not exist"
@@ -1883,6 +1889,7 @@ class ACEStepPipeline:
                 extend_bootstrap_method=extend_bootstrap_method,
                 extend_bootstrap_strength=extend_bootstrap_strength,
                 seam_seconds=seam_seconds,
+                extend_pad_mode=extend_pad_mode,
             )
 
         end_time = time.time()

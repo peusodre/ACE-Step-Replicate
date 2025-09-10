@@ -221,6 +221,11 @@ class Predictor(BasePredictor):
             description="Duration of tapered repaint seam at the join (seconds)",
             default=0.75, ge=0.1, le=2.0,
         ),
+        extend_pad_mode: str = Input(
+            description="How to seed extend pads",
+            default="boot_only",  # <-- default to what you want now
+            choices=["boot_only", "boot_plus_noise"],
+        ),
 
         # ---- Style transfer (edit) -------------------------------------------
         style_prompt: str = Input(
@@ -428,6 +433,7 @@ class Predictor(BasePredictor):
             "extend_bootstrap_method": str(extend_bootstrap_method),
             "extend_bootstrap_strength": float(extend_bootstrap_strength),
             "seam_seconds": float(seam_seconds),
+            "extend_pad_mode": str(extend_pad_mode),
         }
 
         if pipeline_params["src_audio_path"]:
