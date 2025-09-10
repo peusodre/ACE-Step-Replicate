@@ -35,7 +35,6 @@ build:
     - "soundfile==0.13.1"
     # Data processing
     - "datasets==3.4.1"
-    - "numpy"
     - "matplotlib==3.10.1"
     # Utilities
     - "tqdm"
@@ -52,15 +51,15 @@ build:
     # Web interface (may be needed for some components)
     - "gradio"
 
-  # Install PyTorch and dependencies
+  # Install PyTorch and dependencies with optimizations
   run:
+    # Install PyTorch with CUDA support
     - "pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu121 torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0"
+    # Clean up conflicting packages
     - "pip uninstall -y pydantic thinc spacy fastapi numpy || true"
-    - "pip install --no-cache-dir numpy==1.24.3"
-    - "pip install --no-cache-dir pydantic==1.10.13"
-    - "pip install --no-cache-dir 'thinc>=8.1.0,<8.2.0'"
-    - "pip install --no-cache-dir spacy==3.7.2"
-    - "pip install --no-cache-dir fastapi==0.104.1"
+    # Install core packages with specific versions
+    - "pip install --no-cache-dir numpy==1.24.3 pydantic==1.10.13 'thinc>=8.1.0,<8.2.0' spacy==3.7.2 fastapi==0.104.1"
+    # Install remaining packages
     - "pip install --no-cache-dir pytorch_lightning==2.5.1 peft tensorboard tensorboardX"
 
 # Predict interface

@@ -127,6 +127,10 @@ class Predictor(BasePredictor):
     def setup(self) -> None:
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
         
+        # Optimize for faster loading
+        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+        os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+
         dtype = "bfloat16"
         try:
             if torch.backends.mps.is_available():
