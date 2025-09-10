@@ -1040,6 +1040,10 @@ class ACEStepPipeline:
                     repaint_end_frame = frame_length
                     gt_latents = extend_gt_latents
 
+                # Debug log for extend padding
+                logger.info(f"[EXTEND] left_pad={left_pad_frame_length}  right_pad={right_pad_frame_length}  "
+                           f"left_trim={left_trim_length}  right_trim={right_trim_length}")
+
                 repaint_mask = torch.zeros(
                     (bsz, 8, 16, frame_length), device=self.device, dtype=self.dtype
                 )
@@ -1067,6 +1071,9 @@ class ACEStepPipeline:
                 ), f"{target_latents.shape=} {x0.shape=}"
                 zt_edit = x0.clone()
                 z0 = target_latents
+                
+                # Debug log for extend shapes
+                logger.info(f"[EXTEND] x0.shape={x0.shape}  z0.shape={z0.shape}  target_latents.shape={target_latents.shape}")
 
         if audio2audio_enable and ref_latents is not None:
             logger.info(
@@ -1203,15 +1210,14 @@ class ACEStepPipeline:
         # Final shape guard: ensure z0 and target_latents match x0 along last dim
         if is_repaint:
             need = x0.shape[-1]
-            have = z0.shape[-1]
-            if have != need:
+            for name in ("z0", "target_latents"):
+                t = locals()[name]
+                have = t.shape[-1]
                 if have > need:
-                    z0 = z0[..., :need]  # trim
-                    target_latents = target_latents[..., :need]
-                else:
-                    pad = need - have
-                    z0 = torch.nn.functional.pad(z0, (0, pad))  # right-pad
-                    target_latents = torch.nn.functional.pad(target_latents, (0, pad))
+                    t = t[..., :need]
+                elif have < need:
+                    t = torch.nn.functional.pad(t, (0, need - have))
+                locals()[name] = t
 
         for i, t in tqdm(enumerate(timesteps), total=num_inference_steps):
 
@@ -1372,6 +1378,8 @@ class ACEStepPipeline:
                 target_latents = torch.cat(
                     [to_left_pad_gt_latents, target_latents], dim=-1
                 )
+            # Debug log after re-append
+            logger.info(f"[EXTEND] after re-append: target_latents.shape={target_latents.shape}")
         return target_latents
 
     @cpu_offload("music_dcae")

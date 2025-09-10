@@ -375,7 +375,7 @@ class Predictor(BasePredictor):
             "retake_variance": (
                 float(repaint_strength) if canonical_task == "repaint"
                 else (float(variation_strength) if variation_strength and variation_strength > 0
-                      else (max(0.15, min(0.4, 1.0 - 0.8 * float(extend_strength))) if canonical_task == "extend"
+                      else (max(0.25, min(0.35, 0.3 + 0.1 * float(extend_strength))) if canonical_task == "extend"
                             else float(variation_strength)))
             ),
 
