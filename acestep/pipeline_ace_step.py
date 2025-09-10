@@ -958,11 +958,11 @@ class ACEStepPipeline:
         is_extend = False
 
         if add_retake_noise:
-            n_min = int(infer_steps * (1 - retake_variance))
-            # ensure the '== n_min' branch is reachable
-            n_min = max(1, min(n_min, infer_steps - 1))
             # Keep a scalar copy for scheduling math (fraction in [0,1])
             retake_frac = float(retake_variance)
+            n_min = int(infer_steps * (1 - retake_frac))
+            # ensure the '== n_min' branch is reachable
+            n_min = max(1, min(n_min, infer_steps - 1))
             
             # Angle (tensor) used for mixing latents
             retake_variance = (
@@ -1093,9 +1093,10 @@ class ACEStepPipeline:
                 def _smooth_time(x, k=5):
                     # tiny time smoothing to avoid repeating high-freq transients
                     B, C, H, T = x.shape
-                    x_ = x.view(B * C, H, T)
+                    dtype_orig = x.dtype
+                    x_ = x.to(torch.float32).view(B * C, H, T)                # (N,C,L) for avg_pool1d
                     x_ = torch.nn.functional.avg_pool1d(x_, kernel_size=k, stride=1, padding=k // 2)
-                    return x_.view(B, C, H, T)
+                    return x_.to(dtype_orig).view(B, C, H, T)
 
                 def _rms(x, eps=1e-6):
                     # RMS over time axis only

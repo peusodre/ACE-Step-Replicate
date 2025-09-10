@@ -329,11 +329,8 @@ class Predictor(BasePredictor):
             cfg_type = "apg"
             use_erg_diffusion = False
             use_erg_lyric = False
-            # critical for long extends (reduces integration artifacts)
-            scheduler_type = "heun"
-            # make sure we actually pass more steps down to the pipeline
-            infer_steps = max(int(infer_steps), 90)
-            # slightly gentler transport (helps avoid hiss on long pads)
+            scheduler_type = "heun"                 # more stable transport
+            infer_steps = max(int(infer_steps), 90) # enough steps for long pads
             omega_scale = min(float(omega_scale), 8.0)
         elif canonical_task == "repaint":
             task_kwargs.update({
