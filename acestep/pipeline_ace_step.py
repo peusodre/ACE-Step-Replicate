@@ -961,8 +961,12 @@ class ACEStepPipeline:
             n_min = int(infer_steps * (1 - retake_variance))
             # ensure the '== n_min' branch is reachable
             n_min = max(1, min(n_min, infer_steps - 1))
+            # Keep a scalar copy for scheduling math (fraction in [0,1])
+            retake_frac = float(retake_variance)
+            
+            # Angle (tensor) used for mixing latents
             retake_variance = (
-                torch.tensor(retake_variance * math.pi / 2).to(self.device).to(self.dtype)
+                torch.tensor(retake_frac * math.pi / 2).to(self.device).to(self.dtype)
             )
             retake_latents = randn_tensor(
                 shape=(bsz, 8, 16, frame_length),
@@ -1089,10 +1093,9 @@ class ACEStepPipeline:
                 def _smooth_time(x, k=5):
                     # tiny time smoothing to avoid repeating high-freq transients
                     B, C, H, T = x.shape
-                    dtype_orig = x.dtype
-                    x_ = x.to(torch.float32).view(B * C, H, T)
+                    x_ = x.view(B * C, H, T)
                     x_ = torch.nn.functional.avg_pool1d(x_, kernel_size=k, stride=1, padding=k // 2)
-                    return x_.to(dtype_orig).view(B, C, H, T)
+                    return x_.view(B, C, H, T)
 
                 def _rms(x, eps=1e-6):
                     # RMS over time axis only
@@ -1150,15 +1153,15 @@ class ACEStepPipeline:
                 z0 = torch.cat(parts, dim=-1)
                 zt_edit = x0.clone()
 
-                # --- Soft seam: make a tapered repaint mask near the seam to avoid a hard boundary ---
-                # Start from binary (pad=1, original=0), then taper ~0.75s near both seams inside the pad
+                # --- Soft seam like inpaint: binary mask with a short time ramp only
+                # Start from binary (pad=1, original=0), then taper ~0.5s near both seams inside the pad
                 repaint_mask = torch.zeros_like(zt_edit)
                 if left_pad > 0:
                     repaint_mask[..., :left_pad] = 1.0
                 if right_pad > 0:
                     repaint_mask[..., -right_pad:] = 1.0
 
-                ramp_len = int(max(1, round(0.75 * fps)))
+                ramp_len = int(max(1, round(0.50 * fps)))  # ~0.5s taper is enough
                 if left_pad > 0:
                     L = min(ramp_len, left_pad)
                     ramp = torch.linspace(1.0, 0.0, steps=L, device=self.device, dtype=self.dtype).view(1, 1, 1, L)
@@ -1168,12 +1171,7 @@ class ACEStepPipeline:
                     ramp = torch.linspace(0.0, 1.0, steps=L, device=self.device, dtype=self.dtype).view(1, 1, 1, L)
                     s = frame_length - right_pad
                     repaint_mask[..., s : s + L] = ramp  # 0 -> 1 leaving the seam
-
-                # tilt mask by frequency: keep lows closer to original at the seam
-                Hdim = x0.shape[2]
-                fgrid = torch.linspace(0.0, 1.0, steps=Hdim, device=self.device, dtype=self.dtype).view(1, 1, Hdim, 1)
-                freq_tilt = 0.65 + 0.35 * fgrid  # 0.65 at low freqs → 1.0 at highs
-                repaint_mask = repaint_mask * freq_tilt
+                # (no frequency tilt — match inpaint behavior)
 
                 # Match global stats of z0 to the (padded) source latents to keep distributions compatible
                 def _match_stats(z, ref, eps=1e-6):
@@ -1188,23 +1186,6 @@ class ACEStepPipeline:
 
                 logger.info(f"[EXTEND] (improved) EDGE={EDGE}  ramp_len={ramp_len}  theta_near={float(theta_near):.2f}  theta_far={float(theta_far):.2f}")
                 logger.info(f"[EXTEND] x0.shape={x0.shape}  z0.shape={z0.shape}  target_latents.shape={target_latents.shape}")
-                
-                # --- make sure long pad gets enough diffusion steps ---
-                pad_sec_total = (left_pad + right_pad) / max(1.0, fps)
-                if pad_sec_total >= 10.0:
-                    target_steps = max(int(infer_steps), 60 + int(pad_sec_total * 3.0))
-                else:
-                    target_steps = max(int(infer_steps), 80)
-                if target_steps != num_inference_steps:
-                    timesteps, num_inference_steps = retrieve_timesteps(
-                        scheduler,
-                        num_inference_steps=target_steps,
-                        device=self.device,
-                        timesteps=None,
-                    )
-                    # keep downstream logic in sync
-                    infer_steps = target_steps
-                    logger.info(f"[EXTEND] timesteps recomputed → {num_inference_steps} steps")
 
         if audio2audio_enable and ref_latents is not None:
             logger.info(
@@ -1228,8 +1209,14 @@ class ACEStepPipeline:
         if is_extend:
             start_idx = 0
             end_idx = num_inference_steps
-            guidance_interval_decay = 0.0
-            logger.info("Extend mode: using full-range guidance.")
+            # Use a mild decay so CFG relaxes near the end; in practice this
+            # reduces high-freq fizz on long pads.
+            if guidance_interval_decay == 0.0:
+                guidance_interval_decay = 1.2
+            # Keep min CFG reasonably strong for continuity
+            if min_guidance_scale < 6.0:
+                min_guidance_scale = 6.0
+            logger.info("Extend mode: full-range guidance with mild decay and min_cfg>=6.")
         
         logger.info(
             f"start_idx: {start_idx}, end_idx: {end_idx}, num_inference_steps: {num_inference_steps}"
