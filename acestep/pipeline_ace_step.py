@@ -10,12 +10,12 @@ import random
 import time
 import os
 import re
+import math
 
 import torch
 from loguru import logger
 from tqdm import tqdm
 import json
-import math
 from huggingface_hub import snapshot_download
 
 # from diffusers.pipelines.pipeline_utils import DiffusionPipeline
@@ -1076,39 +1076,110 @@ class ACEStepPipeline:
                     repaint_mask[..., -right_pad:] = 1.0
                 x0 = gt_latents  # reference for blending and zt_src construction
                 
-                # Edge-guided seeding for better quality
-                EDGE = min(128, x0.shape[-1])  # ~1s of latent context
-                theta = torch.tensor(max(0.1, min(0.9, extend_strength)), device=self.device, dtype=self.dtype)
-                noise_mix = 1.0 - theta
-                
+                # ---- Improved seeding for long extends: ramped, energy-matched, multi-second context ----
+
+                # Use a longer context for long pads (2–3s), but never larger than the clip/8
+                EDGE = int(min(max(128, x0.shape[-1] // 8), max(128, int(3.0 * fps))))
+                EDGE = max(128, EDGE)
+
                 def _tile_edge(edge_chunk, need):
                     reps = (need + edge_chunk.shape[-1] - 1) // edge_chunk.shape[-1]
-                    return edge_chunk.repeat(1,1,1,reps)[...,:need]
-                
+                    return edge_chunk.repeat(1, 1, 1, reps)[..., :need]
+
+                def _smooth_time(x, k=5):
+                    # tiny time smoothing to avoid repeating high-freq transients
+                    B, C, H, T = x.shape
+                    x_ = x.view(B * C, H, T)
+                    x_ = torch.nn.functional.avg_pool1d(x_, kernel_size=k, stride=1, padding=k // 2)
+                    return x_.view(B, C, H, T)
+
+                def _rms(x, eps=1e-6):
+                    # RMS over time axis only
+                    return torch.sqrt(torch.clamp((x * x).mean(dim=-1, keepdim=True), min=eps))
+
+                def _match_rms(noise_like, ref_like):
+                    return noise_like * (_rms(ref_like) / (_rms(noise_like) + 1e-6))
+
+                def _ramp_theta(length, theta_near, theta_far):
+                    # cosine ramp from seam (0) -> deep pad (1)
+                    if length <= 1:
+                        return torch.tensor([theta_near], device=self.device, dtype=self.dtype)
+                    t = torch.linspace(0, 1, steps=length, device=self.device, dtype=self.dtype)
+                    w = 0.5 * (1.0 - torch.cos(t * math.pi))  # 0 -> 1
+                    return theta_near + (theta_far - theta_near) * w  # near seam -> deep pad
+
+                # Decide how strongly to follow the edge near seam vs far away
+                pad_sec_total = (left_pad + right_pad) / max(1.0, fps)
+                theta_near = torch.tensor(min(0.95, max(0.6, float(extend_strength))), device=self.device, dtype=self.dtype)
+                # farther out we allow more creativity for very long pads
+                theta_far  = torch.tensor(0.15 if pad_sec_total >= 15.0 else 0.25, device=self.device, dtype=self.dtype)
+
                 left_seed = None
                 right_seed = None
-                
+
                 if left_pad > 0:
-                    left_edge = x0[..., :EDGE].flip(-1)  # mirror the beginning
-                    left_seed = theta * _tile_edge(left_edge, left_pad) + noise_mix * retake_latents[..., :left_pad]
-                
+                    # mirror the beginning for continuity, then smooth
+                    left_edge = _smooth_time(x0[..., :EDGE].flip(-1), k=5)
+                    left_edge_tiled = _tile_edge(left_edge, left_pad)
+
+                    theta_vec = _ramp_theta(left_pad, theta_near, theta_far).view(1, 1, 1, -1)
+                    # energy-match the noise to the edge to avoid hiss
+                    left_noise = _match_rms(retake_latents[..., :left_pad], left_edge_tiled)
+                    left_seed = theta_vec * left_edge_tiled + (1.0 - theta_vec) * left_noise
+
                 if right_pad > 0:
-                    right_edge = x0[..., -EDGE:]  # take the end as-is
-                    right_seed = theta * _tile_edge(right_edge, right_pad) + noise_mix * retake_latents[..., -right_pad:]
-                
-                # Assemble z0 (initial noisy latents) with both seeds
-                mid = target_latents[..., left_trim: target_latents.shape[-1] - right_trim]  # keep same center noise
-                
+                    # take the end as-is (no mirror), then smooth
+                    right_edge = _smooth_time(x0[..., -EDGE:], k=5)
+                    right_edge_tiled = _tile_edge(right_edge, right_pad)
+
+                    theta_vec = _ramp_theta(right_pad, theta_near, theta_far).view(1, 1, 1, -1)
+                    right_noise = _match_rms(retake_latents[..., -right_pad:], right_edge_tiled)
+                    right_seed = theta_vec * right_edge_tiled + (1.0 - theta_vec) * right_noise
+
+                # Assemble z0 using the original mid-noise (trimmed as before to stay aligned)
+                mid = target_latents[..., left_trim : target_latents.shape[-1] - right_trim]
+
                 parts = []
-                if left_pad > 0:  parts.append(left_seed)
+                if left_pad > 0:
+                    parts.append(left_seed)
                 parts.append(mid)
-                if right_pad > 0: parts.append(right_seed)
-                
+                if right_pad > 0:
+                    parts.append(right_seed)
+
                 z0 = torch.cat(parts, dim=-1)
-                target_latents = z0.clone()  # keep them aligned
                 zt_edit = x0.clone()
-                
-                # Debug log for extend shapes
+
+                # --- Soft seam: make a tapered repaint mask near the seam to avoid a hard boundary ---
+                # Start from binary (pad=1, original=0), then taper ~0.75s near both seams inside the pad
+                repaint_mask = torch.zeros_like(zt_edit)
+                if left_pad > 0:
+                    repaint_mask[..., :left_pad] = 1.0
+                if right_pad > 0:
+                    repaint_mask[..., -right_pad:] = 1.0
+
+                ramp_len = int(max(1, round(0.75 * fps)))
+                if left_pad > 0:
+                    L = min(ramp_len, left_pad)
+                    ramp = torch.linspace(1.0, 0.0, steps=L, device=self.device, dtype=self.dtype).view(1, 1, 1, L)
+                    repaint_mask[..., left_pad - L : left_pad] = ramp  # 1 -> 0 towards the seam
+                if right_pad > 0:
+                    L = min(ramp_len, right_pad)
+                    ramp = torch.linspace(0.0, 1.0, steps=L, device=self.device, dtype=self.dtype).view(1, 1, 1, L)
+                    s = frame_length - right_pad
+                    repaint_mask[..., s : s + L] = ramp  # 0 -> 1 leaving the seam
+
+                # Match global stats of z0 to the (padded) source latents to keep distributions compatible
+                def _match_stats(z, ref, eps=1e-6):
+                    m_ref = ref.mean(dim=(1, 2, 3), keepdim=True)
+                    s_ref = ref.std(dim=(1, 2, 3), keepdim=True) + eps
+                    m_z = z.mean(dim=(1, 2, 3), keepdim=True)
+                    s_z = z.std(dim=(1, 2, 3), keepdim=True) + eps
+                    return (z - m_z) * (s_ref / s_z) + m_ref
+
+                z0 = _match_stats(z0, x0)
+                target_latents = z0.clone()
+
+                logger.info(f"[EXTEND] (improved) EDGE={EDGE}  ramp_len={ramp_len}  theta_near={float(theta_near):.2f}  theta_far={float(theta_far):.2f}")
                 logger.info(f"[EXTEND] x0.shape={x0.shape}  z0.shape={z0.shape}  target_latents.shape={target_latents.shape}")
 
         if audio2audio_enable and ref_latents is not None:
@@ -1128,6 +1199,13 @@ class ACEStepPipeline:
         # guidance interval
         start_idx = int(num_inference_steps * ((1 - guidance_interval) / 2))
         end_idx = int(num_inference_steps * (guidance_interval / 2 + 0.5))
+        
+        # For long extends we keep guidance active across the full schedule
+        if is_extend:
+            start_idx = 0
+            end_idx = num_inference_steps
+            logger.info("Extend mode: using full-range guidance.")
+        
         logger.info(
             f"start_idx: {start_idx}, end_idx: {end_idx}, num_inference_steps: {num_inference_steps}"
         )
@@ -1395,9 +1473,8 @@ class ACEStepPipeline:
                 prev_sample = prev_sample.to(self.dtype)
                 target_latents = prev_sample
                 zt_src = (1 - t_im1) * x0 + (t_im1) * z0
-                target_latents = torch.where(
-                    repaint_mask == 1.0, target_latents, zt_src
-                )
+                # Soft blend (mask is 1.0 deep in pad, tapers to 0.0 at the seam)
+                target_latents = repaint_mask * target_latents + (1.0 - repaint_mask) * zt_src
             else:
                 target_latents = scheduler.step(
                     model_output=noise_pred,
