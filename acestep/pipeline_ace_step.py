@@ -1405,7 +1405,11 @@ class ACEStepPipeline:
                 z0 = _match_stats(z0, x0)
                 target_latents = z0.clone()
 
-                logger.info(f"[EXTEND] (improved) EDGE={EDGE}  ramp_len={ramp_len}  theta_near={float(theta_near):.2f}  theta_far={float(theta_far):.2f}")
+                if not extend_tile_only:
+                    logger.info(f"[EXTEND] (improved) EDGE={EDGE}  ramp_len={ramp_len}  "
+                                f"theta_near={float(theta_near):.2f}  theta_far={float(theta_far):.2f}")
+                else:
+                    logger.info(f"[EXTEND] (tile→repaint) EDGE={EDGE}  ramp_len={ramp_len}")
                 logger.info(f"[EXTEND] x0.shape={x0.shape}  z0.shape={z0.shape}  target_latents.shape={target_latents.shape}")
 
         if audio2audio_enable and ref_latents is not None:
