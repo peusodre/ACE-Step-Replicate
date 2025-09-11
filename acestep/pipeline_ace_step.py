@@ -127,6 +127,11 @@ def _nan_guard(tag, x):
     if bad: 
         logger.warning(f"[NAN] {tag} has NaN/Inf!")
 
+def _clamp_span(l_min, l_max, L):
+    l_min = max(0, min(l_min, L-1))
+    l_max = max(l_min+1, min(l_max, L))
+    return l_min, l_max
+
 
 torch.backends.cudnn.benchmark = False
 torch.set_float32_matmul_precision("high")
@@ -322,7 +327,7 @@ class ACEStepPipeline:
             self.ace_step_transformer = (
                 self.ace_step_transformer.to(self.device).eval().to(self.dtype)
             )
-        if self.torch_compile:
+        if self.torch_compile and self.device.type == "cuda" and not self.quantized:
             self.ace_step_transformer = torch.compile(self.ace_step_transformer)
 
         self.music_dcae = MusicDCAE(
@@ -334,7 +339,7 @@ class ACEStepPipeline:
             self.music_dcae = self.music_dcae.to("cpu").eval().to(self.dtype)
         else:
             self.music_dcae = self.music_dcae.to(self.device).eval().to(self.dtype)
-        if self.torch_compile:
+        if self.torch_compile and self.device.type == "cuda" and not self.quantized:
             self.music_dcae = torch.compile(self.music_dcae)
 
         lang_segment = LangSegment()
@@ -352,7 +357,7 @@ class ACEStepPipeline:
             text_encoder_model = text_encoder_model.to(self.device).eval().to(self.dtype)
         text_encoder_model.requires_grad_(False)
         self.text_encoder_model = text_encoder_model
-        if self.torch_compile:
+        if self.torch_compile and self.device.type == "cuda" and not self.quantized:
             self.text_encoder_model = torch.compile(self.text_encoder_model)
 
         self.text_tokenizer = AutoTokenizer.from_pretrained(
@@ -408,34 +413,36 @@ class ACEStepPipeline:
         ace_step_checkpoint_path = os.path.join(checkpoint_dir, "ace_step_transformer")
         text_encoder_checkpoint_path = os.path.join(checkpoint_dir, "umt5-base")
 
+        target = "cpu" if self.cpu_offload else self.device
+        
         self.music_dcae = MusicDCAE(
             dcae_checkpoint_path=dcae_checkpoint_path,
             vocoder_checkpoint_path=vocoder_checkpoint_path,
         )
-        if self.cpu_offload:
-            self.music_dcae.eval().to(self.dtype).to(self.device)
-        else:
-            self.music_dcae.eval().to(self.dtype).to('cpu')
-        self.music_dcae = torch.compile(self.music_dcae)
+        self.music_dcae.eval().to(self.dtype).to(target)
+        if self.torch_compile and self.device.type == "cuda" and not self.quantized:
+            self.music_dcae = torch.compile(self.music_dcae)
 
         self.ace_step_transformer = ACEStepTransformer2DModel.from_pretrained(ace_step_checkpoint_path)
-        self.ace_step_transformer.eval().to(self.dtype).to('cpu')
-        self.ace_step_transformer = torch.compile(self.ace_step_transformer)
+        self.ace_step_transformer.eval().to(self.dtype).to(target)
+        if self.torch_compile and self.device.type == "cuda" and not self.quantized:
+            self.ace_step_transformer = torch.compile(self.ace_step_transformer)
         self.ace_step_transformer.load_state_dict(
             torch.load(
                 os.path.join(ace_step_checkpoint_path, "diffusion_pytorch_model_int4wo.bin"),
-                map_location=self.device,
+                map_location=target,
             ),assign=True
         )
         self.ace_step_transformer.torchao_quantized = True
 
         self.text_encoder_model = UMT5EncoderModel.from_pretrained(text_encoder_checkpoint_path)
-        self.text_encoder_model.eval().to(self.dtype).to('cpu')
-        self.text_encoder_model = torch.compile(self.text_encoder_model)
+        self.text_encoder_model.eval().to(self.dtype).to(target)
+        if self.torch_compile and self.device.type == "cuda" and not self.quantized:
+            self.text_encoder_model = torch.compile(self.text_encoder_model)
         self.text_encoder_model.load_state_dict(
             torch.load(
                 os.path.join(text_encoder_checkpoint_path, "pytorch_model_int4wo.bin"),
-                map_location=self.device,
+                map_location=target,
             ), assign=True
         )
         self.text_encoder_model.torchao_quantized = True
@@ -491,7 +498,9 @@ class ACEStepPipeline:
                 output[:] *= tau
                 return output
 
-            for i in range(l_min, l_max):
+            L = len(self.text_encoder_model.encoder.block)
+            lm, lx = _clamp_span(l_min, l_max, L)
+            for i in range(lm, lx):
                 handler = (
                     self.text_encoder_model.encoder.block[i]
                     .layer[0]
@@ -785,7 +794,8 @@ class ACEStepPipeline:
 
         logger.info("flowedit start from {} to {}".format(n_min, n_max))
 
-        for i, t in tqdm(enumerate(timesteps), total=T_steps):
+        use_bar = bool(self.debug.enabled)
+        for i, t in tqdm(enumerate(timesteps), total=T_steps, disable=not use_bar):
 
             if i < n_min:
                 continue
@@ -923,7 +933,7 @@ class ACEStepPipeline:
                 sigma_max=sigma_max
             )
 
-        infer_steps = int(sigma_max * infer_steps)
+        infer_steps = max(1, int(round(sigma_max * infer_steps)))
         timesteps, num_inference_steps = retrieve_timesteps(
             scheduler,
             num_inference_steps=infer_steps,
@@ -931,7 +941,10 @@ class ACEStepPipeline:
             timesteps=None,
         )
         noisy_image = gt_latents * (1 - scheduler.sigma_max) + noise * scheduler.sigma_max
-        logger.info(f"{scheduler.sigma_min=} {scheduler.sigma_max=} {timesteps=} {num_inference_steps=}")
+        first = float(timesteps[0]/1000)
+        last = float(timesteps[-1]/1000)
+        logger.info(f"{scheduler.sigma_min=} {scheduler.sigma_max=} steps={num_inference_steps} "
+                    f"t=[{first:.4f}…{last:.4f}]")
         return noisy_image, timesteps, scheduler, num_inference_steps
 
     @cpu_offload("ace_step_transformer")
@@ -1221,7 +1234,6 @@ class ACEStepPipeline:
                 # Ignore negative repaint_start for extension; do not pad the left at all.
                 # Compute desired extension purely from repaint_end.
                 desired_end_f = max(src_len, repaint_end_frame)  # never earlier than src end
-                left_pad  = 0
                 right_pad = max(0, desired_end_f - src_len)
                 new_len   = src_len + right_pad
 
@@ -1376,7 +1388,9 @@ class ACEStepPipeline:
                 output[:] *= tau
                 return output
 
-            for i in range(l_min, l_max):
+            L = len(self.ace_step_transformer.lyric_encoder.encoders)
+            lm, lx = _clamp_span(l_min, l_max, L)
+            for i in range(lm, lx):
                 handler = self.ace_step_transformer.lyric_encoder.encoders[
                     i
                 ].self_attn.linear_q.register_forward_hook(hook)
@@ -1459,7 +1473,9 @@ class ACEStepPipeline:
                 output[:] *= tau
                 return output
 
-            for i in range(l_min, l_max):
+            L = len(self.ace_step_transformer.transformer_blocks)
+            lm, lx = _clamp_span(l_min, l_max, L)
+            for i in range(lm, lx):
                 handler = self.ace_step_transformer.transformer_blocks[
                     i
                 ].attn.to_q.register_forward_hook(hook)
@@ -1523,9 +1539,6 @@ class ACEStepPipeline:
                     logger.info(f"[SIG] i={i} sigma={sig:.5f}")
                 except Exception:
                     pass
-                
-                # NaN guard for noise prediction
-                _nan_guard("noise_pred", noise_pred)
 
             if add_retake_noise and (src_latents is not None) and is_repaint:
                 if i < n_min:
@@ -1556,9 +1569,8 @@ class ACEStepPipeline:
                 # compute current guidance scale
                 if guidance_interval_decay > 0:
                     # Linearly interpolate to calculate the current guidance scale
-                    progress = (i - start_idx) / (
-                        end_idx - start_idx - 1
-                    )  # 归一化到[0,1]
+                    den = max(1, (end_idx - start_idx - 1))
+                    progress = (i - start_idx) / den  # 归一化到[0,1]
                     current_guidance_scale = (
                         guidance_scale
                         - (guidance_scale - min_guidance_scale)
@@ -1651,6 +1663,9 @@ class ACEStepPipeline:
                         zero_steps=zero_steps,
                         use_zero_init=use_zero_init,
                     )
+                
+                # NaN guard for noise prediction
+                _nan_guard("noise_pred", noise_pred)
             else:
                 latent_model_input = latents
                 timestep = t.expand(latent_model_input.shape[0])
@@ -1662,6 +1677,9 @@ class ACEStepPipeline:
                     output_length=latent_model_input.shape[-1],
                     timestep=timestep,
                 ).sample
+                
+                # NaN guard for noise prediction
+                _nan_guard("noise_pred", noise_pred)
 
             if is_repaint and i >= n_min:
                 t_i = t / 1000
@@ -1785,9 +1803,7 @@ class ACEStepPipeline:
                 output_path_wav = save_path
 
         target_wav = target_wav.float()
-        backend = "soundfile"
-        if format == "ogg":
-            backend = "sox"
+        backend = "sox_io" if format.lower() == "ogg" else "soundfile"
         logger.info(f"Saving audio to {output_path_wav} using backend {backend}")
         torchaudio.save(
             output_path_wav, target_wav, sample_rate=sample_rate, format=format, backend=backend
