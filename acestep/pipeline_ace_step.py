@@ -47,7 +47,7 @@ from acestep.apg_guidance import (
     cfg_double_condition_forward,
 )
 import torchaudio
-from .cpu_offload import cpu_offload
+from acestep.cpu_offload import cpu_offload
 
 
 torch.backends.cudnn.benchmark = False
@@ -93,49 +93,11 @@ def _frames_per_second(sample_rate: int) -> float:
 
 
 REPO_ID = "ACE-Step/ACE-Step-v1-3.5B"
-REPO_ID_QUANT = REPO_ID + "-q4-K-M" # ??? update this i guess
+REPO_ID_QUANT = REPO_ID + "-q4-K-M"  # optional quant id
 
 
 # class ACEStepPipeline(DiffusionPipeline):
 class ACEStepPipeline:
-    def _latent_rms(self, x, eps=1e-6):
-        # RMS over time axis only, averaged across batch/channels
-        return float(torch.sqrt(torch.clamp((x * x).mean(dim=-1), eps)).mean().detach().cpu())
-
-    def _latent_stats(self, x):
-        m = float(x.mean().detach().cpu())
-        s = float(x.std().detach().cpu())
-        mx = float(x.max().detach().cpu())
-        mn = float(x.min().detach().cpu())
-        return m, s, mn, mx
-
-    def _avg_time(self, x, k=5):
-        B, C, H, T = x.shape
-        y = x.to(torch.float32).view(B*C, H, T)
-        y = torch.nn.functional.avg_pool1d(y, kernel_size=k, stride=1, padding=k//2)
-        return y.view(B, C, H, T).to(x.dtype)
-
-    def _match_rms_like(self, z, ref, eps=1e-6):
-        def _rms(v):
-            return torch.sqrt(torch.clamp((v*v).mean(dim=-1, keepdim=True), eps))
-        return z * (_rms(ref) / (_rms(z) + eps))
-
-    def _match_global_stats(self, z, ref, eps=1e-6):
-        m_ref = ref.mean(dim=(1,2,3), keepdim=True)
-        s_ref = ref.std(dim=(1,2,3), keepdim=True) + eps
-        m_z   = z.mean(dim=(1,2,3), keepdim=True)
-        s_z   = z.std(dim=(1,2,3), keepdim=True) + eps
-        return (z - m_z) * (s_ref / s_z) + m_ref
-
-    def _safe_cap(self, name, val, lo, hi):
-        if val < lo:
-            logger.warning(f"[CAP] {name} {val} < {lo} -> {lo}")
-            return lo
-        if val > hi:
-            logger.warning(f"[CAP] {name} {val} > {hi} -> {hi}")
-            return hi
-        return val
-
     def __init__(
         self,
         checkpoint_dir=None,
@@ -170,12 +132,15 @@ class ACEStepPipeline:
         if device.type == "cpu" and torch.backends.mps.is_available():
             device = torch.device("mps")
         self.dtype = torch.bfloat16 if dtype == "bfloat16" else torch.float32
-        if device.type == "mps" and self.dtype == torch.bfloat16:
+        if device.type == "mps" and self.dtype == "bfloat16":
             self.dtype = torch.float16
         if device.type == "mps":
             self.dtype = torch.float32
-        if 'ACE_PIPELINE_DTYPE' in os.environ and len(os.environ['ACE_PIPELINE_DTYPE']):
-            self.dtype = getattr(torch, os.environ['ACE_PIPELINE_DTYPE'])
+        if "ACE_PIPELINE_DTYPE" in os.environ and len(os.environ["ACE_PIPELINE_DTYPE"]):
+            try:
+                self.dtype = getattr(torch, os.environ["ACE_PIPELINE_DTYPE"])
+            except Exception:
+                logger.warning("Invalid ACE_PIPELINE_DTYPE, falling back to default dtype.")
         self.device = device
         self.loaded = False
         self.torch_compile = torch_compile
@@ -185,22 +150,17 @@ class ACEStepPipeline:
 
     def cleanup_memory(self):
         """Clean up GPU and CPU memory to prevent VRAM overflow during multiple generations."""
-        # Clear CUDA cache
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-
-            # Log memory usage if in verbose mode
             allocated = torch.cuda.memory_allocated() / (1024 ** 3)
             reserved = torch.cuda.memory_reserved() / (1024 ** 3)
             logger.info(f"GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
-
-        # Collect Python garbage
         import gc
         gc.collect()
 
     def get_checkpoint_path(self, checkpoint_dir, repo):
         checkpoint_dir_models = None
-        
+
         if checkpoint_dir is not None:
             required_dirs = ["music_dcae_f8c8", "music_vocoder", "ace_step_transformer", "umt5-base"]
             all_dirs_exist = True
@@ -209,11 +169,11 @@ class ACEStepPipeline:
                 if not os.path.exists(dir_path):
                     all_dirs_exist = False
                     break
-            
+
             if all_dirs_exist:
                 logger.info(f"Load models from: {checkpoint_dir}")
                 checkpoint_dir_models = checkpoint_dir
-        
+
         if checkpoint_dir_models is None:
             if checkpoint_dir is None:
                 logger.info(f"Download models from Hugging Face: {repo}")
@@ -233,15 +193,10 @@ class ACEStepPipeline:
         self.ace_step_transformer = ACEStepTransformer2DModel.from_pretrained(
             ace_step_checkpoint_path, torch_dtype=self.dtype
         )
-        # self.ace_step_transformer.to(self.device).eval().to(self.dtype)
         if self.cpu_offload:
-            self.ace_step_transformer = (
-                self.ace_step_transformer.to("cpu").eval().to(self.dtype)
-            )
+            self.ace_step_transformer = self.ace_step_transformer.to("cpu").eval().to(self.dtype)
         else:
-            self.ace_step_transformer = (
-                self.ace_step_transformer.to(self.device).eval().to(self.dtype)
-            )
+            self.ace_step_transformer = self.ace_step_transformer.to(self.device).eval().to(self.dtype)
         if self.torch_compile:
             self.ace_step_transformer = torch.compile(self.ace_step_transformer)
 
@@ -249,8 +204,7 @@ class ACEStepPipeline:
             dcae_checkpoint_path=dcae_checkpoint_path,
             vocoder_checkpoint_path=vocoder_checkpoint_path,
         )
-        # self.music_dcae.to(self.device).eval().to(self.dtype)
-        if self.cpu_offload:  # might be redundant
+        if self.cpu_offload:
             self.music_dcae = self.music_dcae.to("cpu").eval().to(self.dtype)
         else:
             self.music_dcae = self.music_dcae.to(self.device).eval().to(self.dtype)
@@ -265,7 +219,6 @@ class ACEStepPipeline:
         text_encoder_model = UMT5EncoderModel.from_pretrained(
             text_encoder_checkpoint_path, torch_dtype=self.dtype
         ).eval()
-        # text_encoder_model = text_encoder_model.to(self.device).to(self.dtype)
         if self.cpu_offload:
             text_encoder_model = text_encoder_model.to("cpu").eval().to(self.dtype)
         else:
@@ -275,51 +228,25 @@ class ACEStepPipeline:
         if self.torch_compile:
             self.text_encoder_model = torch.compile(self.text_encoder_model)
 
-        self.text_tokenizer = AutoTokenizer.from_pretrained(
-            text_encoder_checkpoint_path
-        )
+        self.text_tokenizer = AutoTokenizer.from_pretrained(text_encoder_checkpoint_path)
         self.loaded = True
 
-        # compile
-        if self.torch_compile:
-            if export_quantized_weights:
-                from torch.ao.quantization import (
-                    quantize_,
-                    Int4WeightOnlyConfig,
-                )
+        if self.torch_compile and export_quantized_weights:
+            from torch.ao.quantization import quantize_, Int4WeightOnlyConfig
 
-                group_size = 128
-                use_hqq = True
-                quantize_(
-                    self.ace_step_transformer,
-                    Int4WeightOnlyConfig(group_size=group_size, use_hqq=use_hqq),
-                )
-                quantize_(
-                    self.text_encoder_model,
-                    Int4WeightOnlyConfig(group_size=group_size, use_hqq=use_hqq),
-                )
+            group_size = 128
+            use_hqq = True
+            quantize_(self.ace_step_transformer, Int4WeightOnlyConfig(group_size=group_size, use_hqq=use_hqq))
+            quantize_(self.text_encoder_model, Int4WeightOnlyConfig(group_size=group_size, use_hqq=use_hqq))
 
-                # save quantized weights
-                torch.save(
-                    self.ace_step_transformer.state_dict(),
-                    os.path.join(
-                        ace_step_checkpoint_path, "diffusion_pytorch_model_int4wo.bin"
-                    ),
-                )
-                print(
-                    "Quantized Weights Saved to: ",
-                    os.path.join(
-                        ace_step_checkpoint_path, "diffusion_pytorch_model_int4wo.bin"
-                    ),
-                )
-                torch.save(
-                    self.text_encoder_model.state_dict(),
-                    os.path.join(text_encoder_checkpoint_path, "pytorch_model_int4wo.bin"),
-                )
-                print(
-                    "Quantized Weights Saved to: ",
-                    os.path.join(text_encoder_checkpoint_path, "pytorch_model_int4wo.bin"),
-                )
+            torch.save(
+                self.ace_step_transformer.state_dict(),
+                os.path.join(ace_step_checkpoint_path, "diffusion_pytorch_model_int4wo.bin"),
+            )
+            torch.save(
+                self.text_encoder_model.state_dict(),
+                os.path.join(text_encoder_checkpoint_path, "pytorch_model_int4wo.bin"),
+            )
 
     def load_quantized_checkpoint(self, checkpoint_dir=None):
         checkpoint_dir = self.get_checkpoint_path(checkpoint_dir, REPO_ID_QUANT)
@@ -335,34 +262,31 @@ class ACEStepPipeline:
         if self.cpu_offload:
             self.music_dcae.eval().to(self.dtype).to(self.device)
         else:
-            self.music_dcae.eval().to(self.dtype).to('cpu')
+            self.music_dcae.eval().to(self.dtype).to("cpu")
         self.music_dcae = torch.compile(self.music_dcae)
 
         self.ace_step_transformer = ACEStepTransformer2DModel.from_pretrained(ace_step_checkpoint_path)
-        self.ace_step_transformer.eval().to(self.dtype).to('cpu')
+        self.ace_step_transformer.eval().to(self.dtype).to("cpu")
         self.ace_step_transformer = torch.compile(self.ace_step_transformer)
         self.ace_step_transformer.load_state_dict(
             torch.load(
                 os.path.join(ace_step_checkpoint_path, "diffusion_pytorch_model_int4wo.bin"),
                 map_location=self.device,
-            ),assign=True
+            ),
+            assign=True,
         )
         self.ace_step_transformer.torchao_quantized = True
 
         self.text_encoder_model = UMT5EncoderModel.from_pretrained(text_encoder_checkpoint_path)
-        self.text_encoder_model.eval().to(self.dtype).to('cpu')
+        self.text_encoder_model.eval().to(self.dtype).to("cpu")
         self.text_encoder_model = torch.compile(self.text_encoder_model)
         self.text_encoder_model.load_state_dict(
-            torch.load(
-                os.path.join(text_encoder_checkpoint_path, "pytorch_model_int4wo.bin"),
-                map_location=self.device,
-            ), assign=True
+            torch.load(os.path.join(text_encoder_checkpoint_path, "pytorch_model_int4wo.bin"), map_location=self.device),
+            assign=True,
         )
         self.text_encoder_model.torchao_quantized = True
 
-        self.text_tokenizer = AutoTokenizer.from_pretrained(
-            text_encoder_checkpoint_path
-        )
+        self.text_tokenizer = AutoTokenizer.from_pretrained(text_encoder_checkpoint_path)
 
         lang_segment = LangSegment()
         lang_segment.setfilters(language_filters.default)
@@ -374,11 +298,7 @@ class ACEStepPipeline:
     @cpu_offload("text_encoder_model")
     def get_text_embeddings(self, texts, text_max_length=256):
         inputs = self.text_tokenizer(
-            texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=text_max_length,
+            texts, return_tensors="pt", padding=True, truncation=True, max_length=text_max_length
         )
         inputs = {key: value.to(self.device) for key, value in inputs.items()}
         if self.text_encoder_model.device != self.device:
@@ -390,15 +310,9 @@ class ACEStepPipeline:
         return last_hidden_states, attention_mask
 
     @cpu_offload("text_encoder_model")
-    def get_text_embeddings_null(
-        self, texts, text_max_length=256, tau=0.01, l_min=8, l_max=10
-    ):
+    def get_text_embeddings_null(self, texts, text_max_length=256, tau=0.01, l_min=8, l_max=10):
         inputs = self.text_tokenizer(
-            texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=text_max_length,
+            texts, return_tensors="pt", padding=True, truncation=True, max_length=text_max_length
         )
         inputs = {key: value.to(self.device) for key, value in inputs.items()}
         if self.text_encoder_model.device != self.device:
@@ -413,9 +327,7 @@ class ACEStepPipeline:
 
             for i in range(l_min, l_max):
                 handler = (
-                    self.text_encoder_model.encoder.block[i]
-                    .layer[0]
-                    .SelfAttention.q.register_forward_hook(hook)
+                    self.text_encoder_model.encoder.block[i].layer[0].SelfAttention.q.register_forward_hook(hook)
                 )
                 handlers.append(handler)
 
@@ -439,16 +351,12 @@ class ACEStepPipeline:
                     processed_input_seeds = list(map(int, manual_seeds.split(",")))
                 elif manual_seeds.isdigit():
                     processed_input_seeds = int(manual_seeds)
-            elif isinstance(manual_seeds, list) and all(
-                isinstance(s, int) for s in manual_seeds
-            ):
+            elif isinstance(manual_seeds, list) and all(isinstance(s, int) for s in manual_seeds):
                 if len(manual_seeds) > 0:
                     processed_input_seeds = list(manual_seeds)
             elif isinstance(manual_seeds, int):
                 processed_input_seeds = manual_seeds
-        random_generators = [
-            torch.Generator(device=self.device) for _ in range(batch_size)
-        ]
+        random_generators = [torch.Generator(device=self.device) for _ in range(batch_size)]
         actual_seeds = []
         for i in range(batch_size):
             current_seed_for_generator = None
@@ -475,7 +383,7 @@ class ACEStepPipeline:
             language = langCounts[0][0]
             if len(langCounts) > 1 and language == "en":
                 language = langCounts[1][0]
-        except Exception as err:
+        except Exception:
             language = "en"
         return language
 
@@ -503,9 +411,7 @@ class ACEStepPipeline:
                 else:
                     token_idx = self.lyric_tokenizer.encode(line, lang)
                 if debug:
-                    toks = self.lyric_tokenizer.batch_decode(
-                        [[tok_id] for tok_id in token_idx]
-                    )
+                    toks = self.lyric_tokenizer.batch_decode([[tok_id] for tok_id in token_idx])
                     logger.info(f"debbug {line} --> {lang} --> {toks}")
                 lyric_token_idx = lyric_token_idx + token_idx + [2]
             except Exception as e:
@@ -543,7 +449,6 @@ class ACEStepPipeline:
                 torch.cat([zt_src, zt_src]) if do_classifier_free_guidance else zt_src
             )
             timestep = t.expand(src_latent_model_input.shape[0])
-            # source
             noise_pred_src = self.ace_step_transformer(
                 hidden_states=src_latent_model_input,
                 attention_mask=attention_mask,
@@ -556,9 +461,7 @@ class ACEStepPipeline:
             ).sample
 
             if do_classifier_free_guidance:
-                noise_pred_with_cond_src, noise_pred_uncond_src = noise_pred_src.chunk(
-                    2
-                )
+                noise_pred_with_cond_src, noise_pred_uncond_src = noise_pred_src.chunk(2)
                 if cfg_type == "apg":
                     noise_pred_src = apg_forward(
                         pred_cond=noise_pred_with_cond_src,
@@ -577,7 +480,6 @@ class ACEStepPipeline:
             torch.cat([zt_tar, zt_tar]) if do_classifier_free_guidance else zt_tar
         )
         timestep = t.expand(tar_latent_model_input.shape[0])
-        # target
         noise_pred_tar = self.ace_step_transformer(
             hidden_states=tar_latent_model_input,
             attention_mask=attention_mask,
@@ -628,7 +530,6 @@ class ACEStepPipeline:
         n_avg=1,
         scheduler_type="euler",
     ):
-
         do_classifier_free_guidance = True
         if guidance_scale == 0.0 or guidance_scale == 1.0:
             do_classifier_free_guidance = False
@@ -649,51 +550,29 @@ class ACEStepPipeline:
         frame_length = src_latents.shape[-1]
         attention_mask = torch.ones(bsz, frame_length, device=self.device, dtype=self.dtype)
 
-        timesteps, T_steps = retrieve_timesteps(
-            scheduler, T_steps, self.device, timesteps=None
-        )
+        timesteps, T_steps = retrieve_timesteps(scheduler, T_steps, self.device, timesteps=None)
 
         if do_classifier_free_guidance:
             attention_mask = torch.cat([attention_mask] * 2, dim=0)
 
             encoder_text_hidden_states = torch.cat(
-                [
-                    encoder_text_hidden_states,
-                    torch.zeros_like(encoder_text_hidden_states),
-                ],
-                0,
+                [encoder_text_hidden_states, torch.zeros_like(encoder_text_hidden_states)], 0
             )
             text_attention_mask = torch.cat([text_attention_mask] * 2, dim=0)
 
             target_encoder_text_hidden_states = torch.cat(
-                [
-                    target_encoder_text_hidden_states,
-                    torch.zeros_like(target_encoder_text_hidden_states),
-                ],
-                0,
+                [target_encoder_text_hidden_states, torch.zeros_like(target_encoder_text_hidden_states)], 0
             )
-            target_text_attention_mask = torch.cat(
-                [target_text_attention_mask] * 2, dim=0
-            )
+            target_text_attention_mask = torch.cat([target_text_attention_mask] * 2, dim=0)
 
-            speaker_embds = torch.cat(
-                [speaker_embds, torch.zeros_like(speaker_embds)], 0
-            )
-            target_speaker_embeds = torch.cat(
-                [target_speaker_embeds, torch.zeros_like(target_speaker_embeds)], 0
-            )
+            speaker_embds = torch.cat([speaker_embds, torch.zeros_like(speaker_embds)], 0)
+            target_speaker_embeds = torch.cat([target_speaker_embeds, torch.zeros_like(target_speaker_embeds)], 0)
 
-            lyric_token_ids = torch.cat(
-                [lyric_token_ids, torch.zeros_like(lyric_token_ids)], 0
-            )
+            lyric_token_ids = torch.cat([lyric_token_ids, torch.zeros_like(lyric_token_ids)], 0)
             lyric_mask = torch.cat([lyric_mask, torch.zeros_like(lyric_mask)], 0)
 
-            target_lyric_token_ids = torch.cat(
-                [target_lyric_token_ids, torch.zeros_like(target_lyric_token_ids)], 0
-            )
-            target_lyric_mask = torch.cat(
-                [target_lyric_mask, torch.zeros_like(target_lyric_mask)], 0
-            )
+            target_lyric_token_ids = torch.cat([target_lyric_token_ids, torch.zeros_like(target_lyric_token_ids)], 0)
+            target_lyric_mask = torch.cat([target_lyric_mask, torch.zeros_like(target_lyric_mask)], 0)
 
         momentum_buffer = MomentumBuffer()
         momentum_buffer_tar = MomentumBuffer()
@@ -706,30 +585,22 @@ class ACEStepPipeline:
         logger.info("flowedit start from {} to {}".format(n_min, n_max))
 
         for i, t in tqdm(enumerate(timesteps), total=T_steps):
-
             if i < n_min:
                 continue
 
             t_i = t / 1000
-
             if i + 1 < len(timesteps):
                 t_im1 = (timesteps[i + 1]) / 1000
             else:
                 t_im1 = torch.zeros_like(t_i).to(self.device)
 
             if i < n_max:
-                # Calculate the average of the V predictions
                 V_delta_avg = torch.zeros_like(x_src)
-                for k in range(n_avg):
+                for _ in range(n_avg):
                     fwd_noise = randn_tensor(
-                        shape=x_src.shape,
-                        generator=random_generators,
-                        device=self.device,
-                        dtype=self.dtype,
+                        shape=x_src.shape, generator=random_generators, device=self.device, dtype=self.dtype
                     )
-
                     zt_src = (1 - t_i) * x_src + (t_i) * fwd_noise
-
                     zt_tar = zt_edit + zt_src - x_src
 
                     Vt_src, Vt_tar = self.calc_v(
@@ -752,26 +623,22 @@ class ACEStepPipeline:
                         attention_mask=attention_mask,
                         momentum_buffer=momentum_buffer,
                     )
-                    V_delta_avg += (1 / n_avg) * (Vt_tar - Vt_src)  # - (hfg - 1) * (x_src)
+                    V_delta_avg += (1.0 / n_avg) * (Vt_tar - Vt_src)
 
-                zt_edit = zt_edit.to(torch.float32)  # arbitrary, should be settable for compatibility
+                zt_edit = zt_edit.to(torch.float32)
                 if scheduler_type != "pingpong":
-                    # propagate direct ODE
                     zt_edit = zt_edit + (t_im1 - t_i) * V_delta_avg
                     zt_edit = zt_edit.to(self.dtype)
                 else:
-                    # propagate pingpong SDE
                     zt_edit_denoised = zt_edit - t_i * V_delta_avg
-                    noise = torch.empty_like(zt_edit).normal_(generator=random_generators[0] if random_generators else None)
+                    noise = torch.empty_like(zt_edit).normal_(
+                        generator=random_generators[0] if random_generators else None
+                    )
                     prev_sample = (1 - t_im1) * zt_edit_denoised + t_im1 * noise
-
-            else:  # i >= T_steps-n_min # regular sampling for last n_min steps
+            else:
                 if i == n_max:
                     fwd_noise = randn_tensor(
-                        shape=x_src.shape,
-                        generator=random_generators,
-                        device=self.device,
-                        dtype=self.dtype,
+                        shape=x_src.shape, generator=random_generators, device=self.device, dtype=self.dtype
                     )
                     scheduler._init_step_index(t)
                     sigma = scheduler.sigmas[scheduler.step_index]
@@ -807,51 +674,38 @@ class ACEStepPipeline:
                     xt_tar = prev_sample
                 else:
                     prev_sample = xt_tar - t_i * Vt_tar
-                    noise = torch.empty_like(zt_edit).normal_(generator=random_generators[0] if random_generators else None)
+                    noise = torch.empty_like(zt_edit).normal_(
+                        generator=random_generators[0] if random_generators else None
+                    )
                     prev_sample = (1 - t_im1) * prev_sample + t_im1 * noise
                     xt_tar = prev_sample
 
         target_latents = zt_edit if xt_tar is None else xt_tar
         return target_latents
 
-    def add_latents_noise(
-        self,
-        gt_latents,
-        sigma_max,
-        noise,
-        scheduler_type,
-        infer_steps,
-    ):
-
+    def add_latents_noise(self, gt_latents, sigma_max, noise, scheduler_type, infer_steps):
         bsz = gt_latents.shape[0]
         if scheduler_type == "euler":
             scheduler = FlowMatchEulerDiscreteScheduler(
-                num_train_timesteps=1000,
-                shift=3.0,
-                sigma_max=sigma_max,
+                num_train_timesteps=1000, shift=3.0, sigma_max=sigma_max
             )
         elif scheduler_type == "heun":
             scheduler = FlowMatchHeunDiscreteScheduler(
-                num_train_timesteps=1000,
-                shift=3.0,
-                sigma_max=sigma_max,
+                num_train_timesteps=1000, shift=3.0, sigma_max=sigma_max
             )
         elif scheduler_type == "pingpong":
             scheduler = FlowMatchPingPongScheduler(
-                num_train_timesteps=1000,
-                shift=3.0,
-                sigma_max=sigma_max
+                num_train_timesteps=1000, shift=3.0, sigma_max=sigma_max
             )
 
         infer_steps = int(sigma_max * infer_steps)
         timesteps, num_inference_steps = retrieve_timesteps(
-            scheduler,
-            num_inference_steps=infer_steps,
-            device=self.device,
-            timesteps=None,
+            scheduler, num_inference_steps=infer_steps, device=self.device, timesteps=None
         )
         noisy_image = gt_latents * (1 - scheduler.sigma_max) + noise * scheduler.sigma_max
-        logger.info(f"{scheduler.sigma_min=} {scheduler.sigma_max=} {timesteps=} {num_inference_steps=}")
+        logger.info(
+            f"{scheduler.sigma_min=} {scheduler.sigma_max=} {timesteps=} {num_inference_steps=}"
+        )
         return noisy_image, timesteps, scheduler, num_inference_steps
 
     @cpu_offload("ace_step_transformer")
@@ -899,34 +753,15 @@ class ACEStepPipeline:
         seam_seconds=0.75,
         extend_pad_mode="boot_only",
         extend_tile_only=False,
-        extend_edge_bootstrap_only=False,   # <--- NEW
-        extend_tile_then_repaint: bool = False,
-        # ---- extend bootstrap tuning (new) ----
-        extend_bootstrap_edge_sec: float = 2.0,          # how many seconds of edge context to tile from
-        extend_bootstrap_sigma_max: float | None = None, # override the sigma_max used inside bootstrap; None -> derive from extend_bootstrap_strength
-        extend_bootstrap_noise_mode: str = "zeros",      # "zeros" | "matched" | "gauss"
+        # NEW options:
+        extend_tile_keep_center=True,
+        extend_tile_repaint_pads=False,
     ):
-        
-        # Mutual exclusion guards
-        if extend_tile_only and extend_edge_bootstrap_only:
-            logger.warning("Both tile_only and edge_bootstrap_only set; preferring tile_only.")
-            extend_edge_bootstrap_only = False
-        if extend_tile_only and extend_bootstrap:
-            logger.info("tile_only=True → forcing extend_bootstrap=False for purity.")
-            extend_bootstrap = False
-        if extend_tile_only and extend_edge_bootstrap_only: 
-            extend_edge_bootstrap_only = False  # keep exclusivity
-
         logger.info(
             "cfg_type: {}, guidance_scale: {}, omega_scale: {}".format(
                 cfg_type, guidance_scale, omega_scale
             )
         )
-        
-        # Make the two "only" modes mutually exclusive
-        if extend_tile_only and extend_edge_bootstrap_only:
-            logger.warning("Both extend_tile_only and extend_edge_bootstrap_only were set; defaulting to extend_edge_bootstrap_only.")
-            extend_tile_only = False
         do_classifier_free_guidance = True
         if guidance_scale == 0.0 or guidance_scale == 1.0:
             do_classifier_free_guidance = False
@@ -941,58 +776,47 @@ class ACEStepPipeline:
             do_double_condition_guidance = True
             logger.info(
                 "do_double_condition_guidance: {}, guidance_scale_text: {}, guidance_scale_lyric: {}".format(
-                    do_double_condition_guidance,
-                    guidance_scale_text,
-                    guidance_scale_lyric,
+                    do_double_condition_guidance, guidance_scale_text, guidance_scale_lyric
                 )
             )
 
         bsz = encoder_text_hidden_states.shape[0]
 
         if scheduler_type == "euler":
-            scheduler = FlowMatchEulerDiscreteScheduler(
-                num_train_timesteps=1000,
-                shift=3.0,
-            )
+            scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000, shift=3.0)
         elif scheduler_type == "heun":
-            scheduler = FlowMatchHeunDiscreteScheduler(
-                num_train_timesteps=1000,
-                shift=3.0,
-            )
+            scheduler = FlowMatchHeunDiscreteScheduler(num_train_timesteps=1000, shift=3.0)
         elif scheduler_type == "pingpong":
-            scheduler = FlowMatchPingPongScheduler(
-                num_train_timesteps=1000,
-                shift=3.0,
-            )
+            scheduler = FlowMatchPingPongScheduler(num_train_timesteps=1000, shift=3.0)
 
-        # Use the correct sample rate for frame calculations
-        # If we have source latents, use 44.1kHz (MusicDCAE's native rate)
-        # Otherwise use the user-provided sample_rate
+        # fps logic
         if src_latents is not None:
-            # Use MusicDCAE's native sample rate (44.1kHz) for frame calculations
             fps = _frames_per_second(44100)
             logger.info(f"Using 44.1kHz for frame calculations (MusicDCAE native rate): fps={fps:.6f}")
         else:
             fps = _frames_per_second(sample_rate)
             logger.info(f"Using {sample_rate}Hz for frame calculations: fps={fps:.6f}")
-            
+
         frame_length = int(duration * fps)
         if src_latents is not None:
             frame_length = src_latents.shape[-1]
-            
-        logger.info(f"[DBG] fps={fps:.6f}  infer_steps={infer_steps}  guidance_scale={guidance_scale}  min_cfg={min_guidance_scale} cfg_type={cfg_type} scheduler={type(scheduler).__name__}")
-        logger.info(f"[DBG] initial frame_length={frame_length}  src_latents={'yes' if src_latents is not None else 'no'}  ref_latents={'yes' if ref_latents is not None else 'no'}")
-        
+
+        logger.info(
+            f"[DBG] fps={fps:.6f} infer_steps={infer_steps} guidance_scale={guidance_scale} "
+            f"min_cfg={min_guidance_scale} cfg_type={cfg_type} scheduler={type(scheduler).__name__}"
+        )
+        logger.info(
+            f"[DBG] initial frame_length={frame_length} src_latents={'yes' if src_latents is not None else 'no'} "
+            f"ref_latents={'yes' if ref_latents is not None else 'no'}"
+        )
+
         if ref_latents is not None:
             frame_length = ref_latents.shape[-1]
 
         if len(oss_steps) > 0:
             infer_steps = max(oss_steps)
             timesteps, num_inference_steps = retrieve_timesteps(
-                scheduler,
-                num_inference_steps=infer_steps,
-                device=self.device,
-                timesteps=None,
+                scheduler, num_inference_steps=infer_steps, device=self.device, timesteps=None
             )
             new_timesteps = torch.zeros(len(oss_steps), dtype=self.dtype, device=self.device)
             for idx in range(len(oss_steps)):
@@ -1000,130 +824,89 @@ class ACEStepPipeline:
             num_inference_steps = len(oss_steps)
             sigmas = (new_timesteps / 1000).float().cpu().numpy()
             timesteps, num_inference_steps = retrieve_timesteps(
-                scheduler,
-                num_inference_steps=num_inference_steps,
-                device=self.device,
-                sigmas=sigmas,
+                scheduler, num_inference_steps=num_inference_steps, device=self.device, sigmas=sigmas
             )
-            logger.info(
-                f"oss_steps: {oss_steps}, num_inference_steps: {num_inference_steps} after remapping to timesteps {timesteps}"
-            )
+            logger.info(f"oss_steps: {oss_steps}, num_inference_steps: {num_inference_steps}")
         else:
             timesteps, num_inference_steps = retrieve_timesteps(
-                scheduler,
-                num_inference_steps=infer_steps,
-                device=self.device,
-                timesteps=None,
+                scheduler, num_inference_steps=infer_steps, device=self.device, timesteps=None
             )
 
         target_latents = randn_tensor(
-            shape=(bsz, 8, 16, frame_length),
-            generator=random_generators,
-            device=self.device,
-            dtype=self.dtype,
+            shape=(bsz, 8, 16, frame_length), generator=random_generators, device=self.device, dtype=self.dtype
         )
 
         is_repaint = False
         is_extend = False
 
+        # --- retake/repaint window setup ---
         if add_retake_noise:
-            # Keep a scalar copy for scheduling math (fraction in [0,1])
             retake_frac = float(retake_variance)
             n_min = int(infer_steps * (1 - retake_frac))
-            # ensure the '== n_min' branch is reachable
             n_min = max(1, min(n_min, infer_steps - 1))
-            
+
             def _choose_n_min_by_sigma(target_sigma=0.20):
-                # find earliest i where scheduler sigma <= target_sigma
                 try:
-                    # ensure scheduler indices initialized
                     _ = scheduler.sigmas
                     for i, t in enumerate(timesteps):
                         scheduler._init_step_index(t)
                         sig = float(scheduler.sigmas[scheduler.step_index].detach().cpu())
                         if sig <= target_sigma:
-                            return max(1, i)  # keep >=1
+                            return max(1, i)
                 except Exception:
                     pass
                 return None
 
-            # Override n_min to ensure low sigma repaint
             late = _choose_n_min_by_sigma(0.20)
             if late is not None and late > n_min:
                 logger.info(f"[DBG] overriding n_min {n_min} -> {late} to ensure low sigma repaint")
                 n_min = late
-            
-            # Angle (tensor) used for mixing latents
-            retake_variance = (
-                torch.tensor(retake_frac * math.pi / 2).to(self.device).to(self.dtype)
-            )
+
+            retake_variance = torch.tensor(retake_frac * math.pi / 2).to(self.device).to(self.dtype)
             retake_latents = randn_tensor(
-                shape=(bsz, 8, 16, frame_length),
-                generator=retake_random_generators,
-                device=self.device,
-                dtype=self.dtype,
+                shape=(bsz, 8, 16, frame_length), generator=retake_random_generators, device=self.device, dtype=self.dtype
             )
+
             def sec_to_frames(sec: float) -> int:
                 return int(round(sec * fps))
+
             repaint_start_frame = sec_to_frames(repaint_start)
             repaint_end_frame = sec_to_frames(repaint_end)
-            
-            # Log extend/repaint setup details
+
             logger.info(f"repaint_start={repaint_start}, repaint_end={repaint_end}")
-            logger.info(f"src_len_frames={src_latents.shape[-1] if src_latents is not None else None}, frame_length={frame_length}")
-            
-            def _sec(frames): 
-                return frames / max(1.0, fps)
-            
-            logger.info(f"[DBG] repaint_start_frame={repaint_start_frame} ({_sec(repaint_start_frame):.3f}s)  repaint_end_frame={repaint_end_frame} ({_sec(repaint_end_frame):.3f}s)")
-            
-        # Only if we're repainting/retaking/extending (i.e., add_retake_noise) AND we have src_latents
+            logger.info(
+                f"src_len_frames={src_latents.shape[-1] if src_latents is not None else None}, frame_length={frame_length}"
+            )
+            logger.info(
+                f"[DBG] repaint_start_frame={repaint_start_frame} repaint_end_frame={repaint_end_frame}"
+            )
+
         if add_retake_noise and (src_latents is not None):
-            # Clamp to actual src length and guarantee ordering
             src_len = src_latents.shape[-1]
-            
+
             if not ((repaint_start < 0) or (repaint_end > src_len / fps)):
-                # repaint-only behavior: clamp to within the clip
                 repaint_start_frame = max(0, min(repaint_start_frame, src_len))
                 repaint_end_frame = max(0, min(repaint_end_frame, src_len))
             else:
-                # extend behavior: allow overshoot on the right and negative on the left
-                repaint_start_frame = max(-src_len, repaint_start_frame)  # allow negative
-                # DO NOT clamp repaint_end_frame to src_len here
-                repaint_end_frame = max(0, repaint_end_frame)  # only ensure non-negative
-            
+                repaint_start_frame = max(-src_len, repaint_start_frame)
+                repaint_end_frame = max(0, repaint_end_frame)
+
             if repaint_end_frame < repaint_start_frame:
                 repaint_end_frame = repaint_start_frame
 
-            # ↓↓↓ DEDENT everything from here ↓↓↓
             x0 = src_latents
-            # retake
             is_repaint = repaint_end_frame - repaint_start_frame != frame_length
-
             is_extend = (repaint_start_frame < 0) or (repaint_end_frame > frame_length)
             if is_extend:
                 is_repaint = True
 
-            # TODO: train a mask aware repainting controlnet
-            # to make sure mean = 0, std = 1
             if not is_repaint:
-                target_latents = (
-                    torch.cos(retake_variance) * target_latents
-                    + torch.sin(retake_variance) * retake_latents
-                )
+                target_latents = torch.cos(retake_variance) * target_latents + torch.sin(retake_variance) * retake_latents
             elif not is_extend:
-                # if repaint_end_frame
-                repaint_mask = torch.zeros(
-                    (bsz, 8, 16, frame_length), device=self.device, dtype=self.dtype
-                )
+                repaint_mask = torch.zeros((bsz, 8, 16, frame_length), device=self.device, dtype=self.dtype)
                 repaint_mask[:, :, :, repaint_start_frame:repaint_end_frame] = 1.0
-                repaint_noise = (
-                    torch.cos(retake_variance) * target_latents
-                    + torch.sin(retake_variance) * retake_latents
-                )
-                repaint_noise = torch.where(
-                    repaint_mask == 1.0, repaint_noise, target_latents
-                )
+                repaint_noise = torch.cos(retake_variance) * target_latents + torch.sin(retake_variance) * retake_latents
+                repaint_noise = torch.where(repaint_mask == 1.0, repaint_noise, target_latents)
                 zt_edit = x0.clone()
                 z0 = repaint_noise
             elif is_extend:
@@ -1131,103 +914,241 @@ class ACEStepPipeline:
                 src_len = gt_latents.shape[-1]
                 max_infer_fame_length = int(240 * fps)
 
-                # ---- RIGHT-ONLY EXTEND ----
-                # Ignore negative repaint_start for extension; do not pad the left at all.
-                # Compute desired extension purely from repaint_end.
-                desired_end_f = max(src_len, repaint_end_frame)  # never earlier than src end
-                left_pad  = 0
-                right_pad = max(0, desired_end_f - src_len)
-                new_len   = src_len + right_pad
+                target_start_f = repaint_start_frame
+                target_end_f = repaint_end_frame
 
-                # Cap to model length
+                left_pad = max(0, -target_start_f)
+                right_pad = max(0, target_end_f - src_len)
+                new_len = src_len + left_pad + right_pad
+
+                left_trim = right_trim = 0
                 if new_len > max_infer_fame_length:
-                    right_pad = max_infer_fame_length - src_len
-                    new_len   = src_len + right_pad
+                    overflow = new_len - max_infer_fame_length
+                    take_left = min(left_pad, overflow // 2 + overflow % 2)
+                    take_right = min(right_pad, overflow - take_left)
+                    left_trim, right_trim = take_left, take_right
+                    left_pad -= take_left
+                    right_pad -= take_right
+                    new_len = max_infer_fame_length
 
-                # Single-sided pad (time is last dim)
-                if right_pad > 0:
-                    gt_latents = torch.nn.functional.pad(gt_latents, (0, right_pad), "constant", 0)
+                if left_pad or right_pad:
+                    gt_latents = torch.nn.functional.pad(gt_latents, (left_pad, right_pad), "constant", 0)
 
-                # Update frame_length and repaint frames (only right region is editable)
                 frame_length = new_len
-                repaint_start_frame = src_len               # start repaint exactly at seam
-                repaint_end_frame   = src_len + right_pad   # repaint only the extension
+                repaint_start_frame = left_pad
+                repaint_end_frame = left_pad + src_len
 
-                # Logs
-                f2s = lambda f: f / fps
-                logger.info(f"[EXTEND-R] src={src_len}f ({f2s(src_len):.2f}s) right_pad={right_pad}f ({f2s(right_pad):.2f}s) new_len={new_len}f ({f2s(new_len):.2f}s)")
+                logger.info(
+                    f"[EXTEND] src={src_len} left_pad={left_pad} right_pad={right_pad} new_len={frame_length}"
+                )
 
-                # Build repaint mask: 0 on original clip, 1 on padded tail, with a short taper at the seam
-                x0 = gt_latents
-                repaint_mask = torch.zeros_like(gt_latents)
-                if right_pad > 0:
-                    repaint_mask[..., -right_pad:] = 1.0
+                # === TILE-ONLY FAST PATH (no diffusion) ===
+                if is_extend and extend_tile_only:
+                    def _tile_edge(edge_chunk, need):
+                        reps = (need + edge_chunk.shape[-1] - 1) // edge_chunk.shape[-1]
+                        return edge_chunk.repeat(1, 1, 1, reps)[..., :need]
 
-                # ---- TILE-ONLY SEED FOR THE TAIL (no bootstrap) ----
-                # Use last EDGE seconds as a motif; repeat to fill the extension
-                def _avg_time(x, k=5):
-                    B, C, H, T = x.shape
-                    y = x.to(torch.float32).view(B*C, H, T)
-                    y = torch.nn.functional.avg_pool1d(y, kernel_size=k, stride=1, padding=k//2)
-                    return y.view(B, C, H, T).to(x.dtype)
+                    def _smooth_time(x, k=5):
+                        B, C, H, T = x.shape
+                        x_ = x.to(torch.float32).view(B * C, H, T)
+                        x_ = torch.nn.functional.avg_pool1d(x_, kernel_size=k, stride=1, padding=k // 2)
+                        return x_.to(x.dtype).view(B, C, H, T)
 
-                def _tile(edge_chunk, need):
-                    reps = (need + edge_chunk.shape[-1] - 1) // edge_chunk.shape[-1]
-                    return edge_chunk.repeat(1,1,1,reps)[..., :need]
+                    def _match_stats(z, ref, eps=1e-6):
+                        m_ref = ref.mean(dim=(1, 2, 3), keepdim=True)
+                        s_ref = ref.std(dim=(1, 2, 3), keepdim=True) + eps
+                        m_z = z.mean(dim=(1, 2, 3), keepdim=True)
+                        s_z = z.std(dim=(1, 2, 3), keepdim=True) + eps
+                        return (z - m_z) * (s_ref / s_z) + m_ref
 
-                EDGE = max(64, int(round(float(extend_bootstrap_edge_sec if 'extend_bootstrap_edge_sec' in locals() else 2.0) * fps)))
-                mid  = x0[..., :src_len]  # original clip unchanged
+                    # Build stitched latents with original center
+                    EDGE = int(min(max(128, gt_latents.shape[-1] // 8), max(128, int(3.0 * fps))))
+                    EDGE = max(128, EDGE)
 
-                right_seed = None
-                if right_pad > 0:
-                    # take last EDGE frames (no flip), smooth a little, tile
-                    right_edge = _avg_time(x0[..., src_len-EDGE:src_len], k=7) if src_len >= EDGE else _avg_time(x0[..., :src_len], k=7)
-                    right_seed = _tile(right_edge, right_pad)
+                    left_tile = right_tile = None
+                    if left_pad > 0:
+                        left_edge = _smooth_time(gt_latents[..., :EDGE].flip(-1), k=5)
+                        left_tile = _tile_edge(left_edge, left_pad)
+                    if right_pad > 0:
+                        right_edge = _smooth_time(gt_latents[..., -EDGE:], k=5)
+                        right_tile = _tile_edge(right_edge, right_pad)
 
-                    # cosine cross-fade at the seam to avoid a step
-                    R = right_pad
-                    fade = torch.linspace(0.0, 1.0, steps=min(int(round(seam_seconds * fps)), R), device=self.device, dtype=self.dtype)
-                    # Align fade to the front of the pad region
-                    fade_len = fade.numel()
-                    if fade_len > 0:
-                        # blend last fade_len frames of mid into first fade_len of right_seed
-                        cross_A = mid[..., -fade_len:]
-                        cross_B = right_seed[..., :fade_len]
-                        cross   = (1.0 - fade).view(1,1,1,-1) * cross_A + fade.view(1,1,1,-1) * cross_B
-                        right_seed = torch.cat([cross, right_seed[..., fade_len:]], dim=-1)
+                    mid_start = left_pad if left_pad > 0 else 0
+                    mid_end = gt_latents.shape[-1] - (right_pad if right_pad > 0 else 0)
+                    mid_orig = gt_latents[..., mid_start:mid_end]
 
-                # Concatenate: original mid + tiled tail
-                parts = [mid]
-                if right_seed is not None:
-                    parts.append(right_seed)
-                z0 = torch.cat(parts, dim=-1)
+                    parts = []
+                    if left_tile is not None:
+                        parts.append(left_tile)
+                    parts.append(mid_orig)
+                    if right_tile is not None:
+                        parts.append(right_tile)
+                    tiled = torch.cat(parts, dim=-1)
 
-                # RMS + global distribution match keeps vocoder stable
-                z0 = self._match_rms_like(z0, x0)
-                z0 = self._match_global_stats(z0, x0)
+                    # cosine crossfade at seams
+                    ramp_len = int(max(1, round(float(seam_seconds) * fps)))
 
-                target_latents = z0.clone()
-                zt_edit = x0.clone()
+                    def _cos_ramp(n):
+                        t = torch.linspace(0, 1, steps=n, device=tiled.device, dtype=tiled.dtype)
+                        return 0.5 * (1.0 + torch.cos(t * math.pi))  # 1..0
 
-                # soften the repaint mask at seam (on the right only)
-                ramp_len = int(max(1, round(float(seam_seconds) * fps)))
-                if right_pad > 0:
-                    L = min(ramp_len, right_pad)
-                    ramp = torch.linspace(0.0, 1.0, steps=L, device=self.device, dtype=self.dtype).view(1,1,1,L)
-                    s = frame_length - right_pad
-                    repaint_mask[..., s : s + L] = ramp
+                    if left_pad > 0 and ramp_len > 0:
+                        L = min(ramp_len, left_pad, mid_orig.shape[-1])
+                        w = _cos_ramp(L).view(1, 1, 1, L)
+                        tiled[..., left_pad - L : left_pad] = (
+                            tiled[..., left_pad - L : left_pad] * w + mid_orig[..., :L] * (1 - w)
+                        )
 
-                is_repaint = True
-                is_extend  = True
-                logger.info(f"[TILE→REPAINT-R] right-only seed (EDGE={EDGE}) → repaint tail; left kept intact.")
+                    if right_pad > 0 and ramp_len > 0:
+                        L = min(ramp_len, right_pad, mid_orig.shape[-1])
+                        w = _cos_ramp(L).view(1, 1, 1, L)
+                        s = left_pad + mid_orig.shape[-1]
+                        tiled[..., s - L : s] = tiled[..., s - L : s] * (1 - w) + mid_orig[..., -L:] * w
+
+                    tiled = _match_stats(tiled, gt_latents)
+                    if extend_tile_keep_center and (mid_orig.numel() > 0):
+                        s = left_pad
+                        tiled[..., s : s + mid_orig.shape[-1]] = mid_orig
+
+                    logger.info(
+                        "[TILE-ONLY] stitched with original center + cosine crossfades "
+                        f"(left_pad={left_pad}, right_pad={right_pad}, ramp_len={ramp_len}, EDGE={EDGE}) "
+                        f"-> {tuple(tiled.shape)}"
+                    )
+
+                    # If we do NOT want repaint, return immediately
+                    if not extend_tile_repaint_pads:
+                        return tiled
+
+                    # else: fall through into pads-only repaint using tiled as x0/z0
+                    # Build repaint mask on pads (with soft ramps), keep center frozen
+                    repaint_mask = torch.zeros_like(tiled)
+                    if left_pad > 0:
+                        repaint_mask[..., :left_pad] = 1.0
+                    if right_pad > 0:
+                        repaint_mask[..., -right_pad:] = 1.0
+                    if left_pad > 0 and ramp_len > 0:
+                        L = min(ramp_len, left_pad)
+                        ramp = torch.linspace(1.0, 0.0, steps=L, device=self.device, dtype=self.dtype).view(
+                            1, 1, 1, L
+                        )
+                        repaint_mask[..., left_pad - L : left_pad] = ramp
+                    if right_pad > 0 and ramp_len > 0:
+                        L = min(ramp_len, right_pad)
+                        ramp = torch.linspace(0.0, 1.0, steps=L, device=self.device, dtype=self.dtype).view(
+                            1, 1, 1, L
+                        )
+                        s = frame_length - right_pad
+                        repaint_mask[..., s : s + L] = ramp
+
+                    # Set repaint state to mimic the plain repaint flow
+                    x0 = tiled
+                    z0 = tiled.clone()
+                    zt_edit = x0.clone()
+                    target_latents = z0.clone()
+                    is_repaint = True  # ensure repaint loop below runs
+                    # keep previously computed n_min
+
+                # build repaint mask in padded space for non-tile-only branch
+                if not (is_extend and extend_tile_only and extend_tile_repaint_pads):
+                    repaint_mask = torch.zeros_like(gt_latents)
+                    if left_pad > 0:
+                        repaint_mask[..., :left_pad] = 1.0
+                    if right_pad > 0:
+                        repaint_mask[..., -right_pad:] = 1.0
+                    x0 = gt_latents
+
+                    # seeds for z0 with improved bootstrap if desired
+                    EDGE = int(min(max(128, x0.shape[-1] // 8), max(128, int(3.0 * fps))))
+                    EDGE = max(128, EDGE)
+
+                    def _tile_edge(edge_chunk, need):
+                        reps = (need + edge_chunk.shape[-1] - 1) // edge_chunk.shape[-1]
+                        return edge_chunk.repeat(1, 1, 1, reps)[..., :need]
+
+                    def _smooth_time(x, k=5):
+                        B, C, H, T = x.shape
+                        dtype_orig = x.dtype
+                        x_ = x.to(torch.float32).view(B * C, H, T)
+                        x_ = torch.nn.functional.avg_pool1d(x_, kernel_size=k, stride=1, padding=k // 2)
+                        return x_.to(dtype_orig).view(B, C, H, T)
+
+                    def _rms(x, eps=1e-6):
+                        return torch.sqrt(torch.clamp((x * x).mean(dim=-1, keepdim=True), min=eps))
+
+                    def _match_rms(noise_like, ref_like):
+                        return noise_like * (_rms(ref_like) / (_rms(noise_like) + 1e-6))
+
+                    def _ramp_theta(length, theta_near, theta_far):
+                        if length <= 1:
+                            return torch.tensor([theta_near], device=self.device, dtype=self.dtype)
+                        t = torch.linspace(0, 1, steps=length, device=self.device, dtype=self.dtype)
+                        w = 0.5 * (1.0 - torch.cos(t * math.pi))
+                        return theta_near + (theta_far - theta_near) * w
+
+                    pad_sec_total = (left_pad + right_pad) / max(1.0, fps)
+                    theta_near = torch.tensor(min(0.95, max(0.6, float(extend_strength))), device=self.device, dtype=self.dtype)
+                    theta_far = torch.tensor(0.15 if pad_sec_total >= 15.0 else 0.25, device=self.device, dtype=self.dtype)
+
+                    if left_pad > 0:
+                        left_edge = _smooth_time(x0[..., :EDGE].flip(-1), k=5)
+                        left_edge_tiled = _tile_edge(left_edge, left_pad)
+                        theta_vec = _ramp_theta(left_pad, theta_near, theta_far).view(1, 1, 1, -1)
+                        base_seed = _match_rms(retake_latents[..., :left_pad], left_edge_tiled)
+                        left_seed = theta_vec * left_edge_tiled + (1.0 - theta_vec) * base_seed
+                    else:
+                        left_seed = None
+
+                    if right_pad > 0:
+                        right_edge = _smooth_time(x0[..., -EDGE:], k=5)
+                        right_edge_tiled = _tile_edge(right_edge, right_pad)
+                        theta_vec = _ramp_theta(right_pad, theta_near, theta_far).view(1, 1, 1, -1)
+                        base_seed = _match_rms(retake_latents[..., -right_pad:], right_edge_tiled)
+                        right_seed = theta_vec * right_edge_tiled + (1.0 - theta_vec) * base_seed
+                    else:
+                        right_seed = None
+
+                    mid = target_latents[..., left_trim : target_latents.shape[-1] - right_trim]
+                    parts = []
+                    if left_pad > 0:
+                        parts.append(left_seed)
+                    parts.append(mid)
+                    if right_pad > 0:
+                        parts.append(right_seed)
+                    z0 = torch.cat(parts, dim=-1)
+
+                    # soft seam ramps
+                    ramp_len = int(max(1, round(float(seam_seconds) * fps)))
+                    if left_pad > 0:
+                        L = min(ramp_len, left_pad)
+                        ramp = torch.linspace(1.0, 0.0, steps=L, device=self.device, dtype=self.dtype).view(
+                            1, 1, 1, L
+                        )
+                        repaint_mask[..., left_pad - L : left_pad] = ramp
+                    if right_pad > 0:
+                        L = min(ramp_len, right_pad)
+                        ramp = torch.linspace(0.0, 1.0, steps=L, device=self.device, dtype=self.dtype).view(
+                            1, 1, 1, L
+                        )
+                        s = frame_length - right_pad
+                        repaint_mask[..., s : s + L] = ramp
+
+                    def _match_stats(z, ref, eps=1e-6):
+                        m_ref = ref.mean(dim=(1, 2, 3), keepdim=True)
+                        s_ref = ref.std(dim=(1, 2, 3), keepdim=True) + eps
+                        m_z = z.mean(dim=(1, 2, 3), keepdim=True)
+                        s_z = z.std(dim=(1, 2, 3), keepdim=True) + eps
+                        return (z - m_z) * (s_ref / s_z) + m_ref
+
+                    z0 = _match_stats(z0, x0)
+                    zt_edit = x0.clone()
+                    target_latents = z0.clone()
 
         if audio2audio_enable and ref_latents is not None:
-            logger.info(
-                f"audio2audio_enable: {audio2audio_enable}, ref_latents: {ref_latents.shape}"
-            )
+            logger.info(f"audio2audio_enable: {audio2audio_enable}, ref_latents: {ref_latents.shape}")
             target_latents, timesteps, scheduler, num_inference_steps = self.add_latents_noise(
                 gt_latents=ref_latents,
-                sigma_max=(1-ref_audio_strength),
+                sigma_max=(1 - ref_audio_strength),
                 noise=target_latents,
                 scheduler_type=scheduler_type,
                 infer_steps=infer_steps,
@@ -1238,19 +1159,17 @@ class ACEStepPipeline:
         # guidance interval
         start_idx = int(num_inference_steps * ((1 - guidance_interval) / 2))
         end_idx = int(num_inference_steps * (guidance_interval / 2 + 0.5))
-        
-        # For long extends we keep guidance active across the full schedule
+
         if is_extend:
             start_idx = 0
             end_idx = num_inference_steps
-            guidance_interval_decay = 1.2 if guidance_interval_decay == 0.0 else guidance_interval_decay
-            min_guidance_scale = max(6.0, float(min_guidance_scale))
-            omega_scale = min(10.0, float(omega_scale))   # avoid too aggressive steps
-            logger.info(f"[EXTEND-STAB] CFG in full range, min_cfg={min_guidance_scale}, decay={guidance_interval_decay}, omega={omega_scale}")
-        
-        logger.info(
-            f"start_idx: {start_idx}, end_idx: {end_idx}, num_inference_steps: {num_inference_steps}"
-        )
+            if guidance_interval_decay == 0.0:
+                guidance_interval_decay = 1.2
+            if min_guidance_scale < 6.0:
+                min_guidance_scale = 6.0
+            logger.info("Extend mode: full-range guidance with mild decay and min_cfg>=6.")
+
+        logger.info(f"start_idx: {start_idx}, end_idx: {end_idx}, num_inference_steps: {num_inference_steps}")
 
         momentum_buffer = MomentumBuffer()
 
@@ -1262,14 +1181,12 @@ class ACEStepPipeline:
                 return output
 
             for i in range(l_min, l_max):
-                handler = self.ace_step_transformer.lyric_encoder.encoders[
-                    i
-                ].self_attn.linear_q.register_forward_hook(hook)
+                handler = self.ace_step_transformer.lyric_encoder.encoders[i].self_attn.linear_q.register_forward_hook(
+                    hook
+                )
                 handlers.append(handler)
 
-            encoder_hidden_states, encoder_hidden_mask = (
-                self.ace_step_transformer.encode(**inputs)
-            )
+            encoder_hidden_states, encoder_hidden_mask = self.ace_step_transformer.encode(**inputs)
 
             for hook in handlers:
                 hook.remove()
@@ -1278,15 +1195,10 @@ class ACEStepPipeline:
 
         # P(speaker, text, lyric)
         encoder_hidden_states, encoder_hidden_mask = self.ace_step_transformer.encode(
-            encoder_text_hidden_states,
-            text_attention_mask,
-            speaker_embds,
-            lyric_token_ids,
-            lyric_mask,
+            encoder_text_hidden_states, text_attention_mask, speaker_embds, lyric_token_ids, lyric_mask
         )
 
         if use_erg_lyric:
-            # P(null_speaker, text_weaker, lyric_weaker)
             encoder_hidden_states_null = forward_encoder_with_temperature(
                 self,
                 inputs={
@@ -1302,7 +1214,6 @@ class ACEStepPipeline:
                 },
             )
         else:
-            # P(null_speaker, null_text, null_lyric)
             encoder_hidden_states_null, _ = self.ace_step_transformer.encode(
                 torch.zeros_like(encoder_text_hidden_states),
                 text_attention_mask,
@@ -1313,7 +1224,6 @@ class ACEStepPipeline:
 
         encoder_hidden_states_no_lyric = None
         if do_double_condition_guidance:
-            # P(null_speaker, text, lyric_weaker)
             if use_erg_lyric:
                 encoder_hidden_states_no_lyric = forward_encoder_with_temperature(
                     self,
@@ -1325,7 +1235,6 @@ class ACEStepPipeline:
                         "lyric_mask": lyric_mask,
                     },
                 )
-            # P(null_speaker, text, no_lyric)
             else:
                 encoder_hidden_states_no_lyric, _ = self.ace_step_transformer.encode(
                     encoder_text_hidden_states,
@@ -1335,9 +1244,7 @@ class ACEStepPipeline:
                     lyric_mask,
                 )
 
-        def forward_diffusion_with_temperature(
-            self, hidden_states, timestep, inputs, tau=0.01, l_min=15, l_max=20
-        ):
+        def forward_diffusion_with_temperature(self, hidden_states, timestep, inputs, tau=0.01, l_min=15, l_max=20):
             handlers = []
 
             def hook(module, input, output):
@@ -1345,95 +1252,59 @@ class ACEStepPipeline:
                 return output
 
             for i in range(l_min, l_max):
-                handler = self.ace_step_transformer.transformer_blocks[
-                    i
-                ].attn.to_q.register_forward_hook(hook)
+                handler = self.ace_step_transformer.transformer_blocks[i].attn.to_q.register_forward_hook(hook)
                 handlers.append(handler)
-                handler = self.ace_step_transformer.transformer_blocks[
-                    i
-                ].cross_attn.to_q.register_forward_hook(hook)
+                handler = self.ace_step_transformer.transformer_blocks[i].cross_attn.to_q.register_forward_hook(hook)
                 handlers.append(handler)
 
-            sample = self.ace_step_transformer.decode(
-                hidden_states=hidden_states, timestep=timestep, **inputs
-            ).sample
+            sample = self.ace_step_transformer.decode(hidden_states=hidden_states, timestep=timestep, **inputs).sample
 
             for hook in handlers:
                 hook.remove()
 
             return sample
 
-        # Final shape guard: ensure z0 and target_latents match x0 along last dim
-        # Only run if we're in repaint/extend mode and have the required variables
+        # Final shape guard for repaint modes
         if add_retake_noise and (src_latents is not None) and is_repaint:
             need = x0.shape[-1]
-
             if z0.shape[-1] > need:
                 z0 = z0[..., :need]
             elif z0.shape[-1] < need:
                 z0 = torch.nn.functional.pad(z0, (0, need - z0.shape[-1]))
-
             if target_latents.shape[-1] > need:
                 target_latents = target_latents[..., :need]
             elif target_latents.shape[-1] < need:
                 target_latents = torch.nn.functional.pad(target_latents, (0, need - target_latents.shape[-1]))
-                
-            logger.info(f"[DBG] shape guard enforced: target_latents={tuple(target_latents.shape)} z0={tuple(z0.shape)} x0={tuple(x0.shape)} need={need}")
+            logger.info(
+                f"[DBG] shape guard enforced: target_latents={tuple(target_latents.shape)} "
+                f"z0={tuple(z0.shape)} x0={tuple(x0.shape)} need={need}"
+            )
 
-        # Ensure repaint actually starts inside the schedule and at low noise
-        n_min = self._safe_cap("n_min", n_min, 1, num_inference_steps - 2)
-
-        # Log sigma around n_min
-        try:
-            scheduler._init_step_index(timesteps[n_min])
-            sig_here = float(scheduler.sigmas[scheduler.step_index].detach().cpu())
-        except Exception:
-            sig_here = float(timesteps[n_min] / 1000)
-        logger.info(f"[REPAINT] n_min={n_min}/{num_inference_steps}  est_sigma={sig_here:.4f}  start_idx={start_idx} end_idx={end_idx}")
-
+        # --------- Diffusion Loop (plain repaint-style when is_repaint) ---------
         for i, t in tqdm(enumerate(timesteps), total=num_inference_steps):
-
             if add_retake_noise and (src_latents is not None) and is_repaint:
                 if i < n_min:
                     continue
                 elif i == n_min:
                     t_i = t / 1000
-                    zt_src = (1 - t_i) * x0 + (t_i) * z0
+                    zt_src = (1.0 - t_i) * x0 + t_i * z0
                     target_latents = zt_edit + zt_src - x0
                     logger.info(f"repaint start from {n_min} add {t_i} level of noise")
-                    
-                    # Estimate sigma at this t (scheduler must be initialized)
-                    try:
-                        scheduler._init_step_index(t)
-                        sigma_here = float(scheduler.sigmas[scheduler.step_index].detach().cpu())
-                    except Exception:
-                        sigma_here = float(t_i)
-                    logger.info(f"[DBG] repaint n_min={n_min}/{num_inference_steps}  sigma≈{sigma_here:.4f}  retake_frac={float(retake_variance) if isinstance(retake_variance, torch.Tensor)==False else 'tensor'}")
 
-            # expand the latents if we are doing classifier free guidance
             latents = target_latents
-
             is_in_guidance_interval = start_idx <= i < end_idx
+
             if is_in_guidance_interval and do_classifier_free_guidance:
-                # compute current guidance scale
                 if guidance_interval_decay > 0:
-                    # Linearly interpolate to calculate the current guidance scale
-                    progress = (i - start_idx) / (
-                        end_idx - start_idx - 1
-                    )  # 归一化到[0,1]
-                    current_guidance_scale = (
-                        guidance_scale
-                        - (guidance_scale - min_guidance_scale)
-                        * progress
-                        * guidance_interval_decay
-                    )
+                    progress = (i - start_idx) / max(1, (end_idx - start_idx - 1))
+                    current_guidance_scale = guidance_scale - (guidance_scale - min_guidance_scale) * progress * guidance_interval_decay
                 else:
                     current_guidance_scale = guidance_scale
 
                 latent_model_input = latents
                 timestep = t.expand(latent_model_input.shape[0])
                 output_length = latent_model_input.shape[-1]
-                # P(x|speaker, text, lyric)
+
                 noise_pred_with_cond = self.ace_step_transformer.decode(
                     hidden_states=latent_model_input,
                     attention_mask=attention_mask,
@@ -1444,10 +1315,7 @@ class ACEStepPipeline:
                 ).sample
 
                 noise_pred_with_only_text_cond = None
-                if (
-                    do_double_condition_guidance
-                    and encoder_hidden_states_no_lyric is not None
-                ):
+                if do_double_condition_guidance and encoder_hidden_states_no_lyric is not None:
                     noise_pred_with_only_text_cond = self.ace_step_transformer.decode(
                         hidden_states=latent_model_input,
                         attention_mask=attention_mask,
@@ -1479,10 +1347,7 @@ class ACEStepPipeline:
                         timestep=timestep,
                     ).sample
 
-                if (
-                    do_double_condition_guidance
-                    and noise_pred_with_only_text_cond is not None
-                ):
+                if do_double_condition_guidance and noise_pred_with_only_text_cond is not None:
                     noise_pred = cfg_double_condition_forward(
                         cond_output=noise_pred_with_cond,
                         uncond_output=noise_pred_uncond,
@@ -1490,7 +1355,6 @@ class ACEStepPipeline:
                         guidance_scale_text=guidance_scale_text,
                         guidance_scale_lyric=guidance_scale_lyric,
                     )
-
                 elif cfg_type == "apg":
                     noise_pred = apg_forward(
                         pred_cond=noise_pred_with_cond,
@@ -1531,22 +1395,12 @@ class ACEStepPipeline:
                     t_im1 = (timesteps[i + 1]) / 1000
                 else:
                     t_im1 = torch.zeros_like(t_i).to(self.device)
+
                 target_latents = target_latents.to(torch.float32)
                 prev_sample = target_latents + (t_im1 - t_i) * noise_pred
                 prev_sample = prev_sample.to(self.dtype)
-                target_latents = prev_sample
-                zt_src = (1 - t_im1) * x0 + (t_im1) * z0
-                
-                # Mid-run probes
-                if i in (n_min, n_min+1, end_idx-2, end_idx-1):
-                    rms_prev = self._latent_rms(prev_sample)
-                    m,s,_,_ = self._latent_stats(prev_sample)
-                    logger.info(f"[STEP] i={i} t={(float(t)/1000):.4f} rms(prev)={rms_prev:.6f} std(prev)={s:.5f} mean(prev)={m:.5f}")
-                
-                if i in (n_min, n_min+1, end_idx-1, end_idx):
-                    logger.info(f"[DBG] step={i}  t={float(t)/1000:.4f}  in_guidance={start_idx <= i < end_idx}  rms(prev)={_rms_t(prev_sample):.6f}")
-                # Soft blend (mask is 1.0 deep in pad, tapers to 0.0 at the seam)
-                target_latents = repaint_mask * target_latents + (1.0 - repaint_mask) * zt_src
+                zt_src = (1.0 - t_im1) * x0 + t_im1 * z0
+                target_latents = repaint_mask * prev_sample + (1.0 - repaint_mask) * zt_src
             else:
                 target_latents = scheduler.step(
                     model_output=noise_pred,
@@ -1554,13 +1408,12 @@ class ACEStepPipeline:
                     sample=target_latents,
                     return_dict=False,
                     omega=omega_scale,
-                    generator=random_generators[0],
+                    generator=random_generators[0] if random_generators else None,
                 )[0]
 
-        # Note: Re-append code removed - we already trimmed by reducing left_pad/right_pad
-        # so there's nothing left to re-append
-        
-        logger.info(f"[DBG] DONE: is_extend={is_extend}  repaint={(is_repaint)}  final_latents={tuple(target_latents.shape)}  rms={_rms_t(target_latents):.6f}")
+        logger.info(
+            f"[DBG] DONE: is_extend={is_extend} repaint={is_repaint} final_latents={tuple(target_latents.shape)}"
+        )
         return target_latents
 
     @cpu_offload("music_dcae")
@@ -1583,43 +1436,37 @@ class ACEStepPipeline:
         pred_wavs = [pred_wav.cpu().float() for pred_wav in pred_wavs]
         for i in tqdm(range(bs)):
             output_audio_path = self.save_wav_file(
-                pred_wavs[i],
-                i,
-                save_path=save_path,
-                sample_rate=sample_rate,
-                format=format,
+                pred_wavs[i], i, save_path=save_path, sample_rate=sample_rate, format=format
             )
             output_audio_paths.append(output_audio_path)
         return output_audio_paths
 
-    def save_wav_file(
-        self, target_wav, idx, save_path=None, sample_rate=48000, format="wav"
-    ):
+    def save_wav_file(self, target_wav, idx, save_path=None, sample_rate=48000, format="wav"):
         if save_path is None:
             logger.warning("save_path is None, using default path ./outputs/")
             base_path = "./outputs"
             ensure_directory_exists(base_path)
-            output_path_wav = (
-                f"{base_path}/output_{time.strftime('%Y%m%d%H%M%S')}_{idx}."+format
-            )
+            output_path_wav = f"{base_path}/output_{time.strftime('%Y%m%d%H%M%S')}_{idx}." + format
         else:
             dirpart = os.path.dirname(save_path)
             if dirpart:
                 ensure_directory_exists(dirpart)
             if os.path.isdir(save_path):
-                logger.info(f"Provided save_path '{save_path}' is a directory. Appending timestamped filename.")
-                output_path_wav = os.path.join(save_path, f"output_{time.strftime('%Y%m%d%H%M%S')}_{idx}."+format)
+                logger.info(
+                    f"Provided save_path '{save_path}' is a directory. Appending timestamped filename."
+                )
+                output_path_wav = os.path.join(
+                    save_path, f"output_{time.strftime('%Y%m%d%H%M%S')}_{idx}." + format
+                )
             else:
                 output_path_wav = save_path
 
         target_wav = target_wav.float()
         backend = "soundfile"
         if format == "ogg":
-            backend = "sox"
+            backend = "sox_io"
         logger.info(f"Saving audio to {output_path_wav} using backend {backend}")
-        torchaudio.save(
-            output_path_wav, target_wav, sample_rate=sample_rate, format=format, backend=backend
-        )
+        torchaudio.save(output_path_wav, target_wav, sample_rate=sample_rate, format=format, backend=backend)
         return output_path_wav
 
     @cpu_offload("music_dcae")
@@ -1640,8 +1487,15 @@ class ACEStepPipeline:
                 lora_download_path = lora_name_or_path
             if self.lora_path != "none":
                 self.ace_step_transformer.unload_lora()
-            self.ace_step_transformer.load_lora_adapter(os.path.join(lora_download_path, "pytorch_lora_weights.safetensors"), adapter_name="ace_step_lora", with_alpha=True, prefix=None)
-            logger.info(f"Loading lora weights from: {lora_name_or_path} download path is: {lora_download_path} weight: {lora_weight}")
+            self.ace_step_transformer.load_lora_adapter(
+                os.path.join(lora_download_path, "pytorch_lora_weights.safetensors"),
+                adapter_name="ace_step_lora",
+                with_alpha=True,
+                prefix=None,
+            )
+            logger.info(
+                f"Loading lora weights from: {lora_name_or_path} download path is: {lora_download_path} weight: {lora_weight}"
+            )
             set_weights_and_activate_adapters(self.ace_step_transformer, ["ace_step_lora"], [lora_weight])
             self.lora_path = lora_name_or_path
             self.lora_weight = lora_weight
@@ -1697,20 +1551,15 @@ class ACEStepPipeline:
         extend_bootstrap_strength: float = 0.6,
         seam_seconds: float = 0.75,
         extend_pad_mode: str = "boot_only",
-        extend_tile_only: bool = False,   # <--- NEW
-        extend_edge_bootstrap_only: bool = False,
-        extend_tile_then_repaint: bool = False,
-        # ---- extend bootstrap tuning (new) ----
-        extend_bootstrap_edge_sec: float = 2.0,
-        extend_bootstrap_sigma_max: float | None = None,
-        extend_bootstrap_noise_mode: str = "zeros",
+        extend_tile_only: bool = False,   # keeps original center, tiles edges
+        extend_tile_keep_center: bool = True,
+        extend_tile_repaint_pads: bool = False,  # if True, repaint pads after stitching
     ):
-
         start_time = time.time()
 
-
-        # Sanity log to see effective task
-        logger.info(f"EFFECTIVE TASK: {task}  (a2a_enable={audio2audio_enable}, ref_audio_input={'yes' if ref_audio_input else 'no'})")
+        logger.info(
+            f"EFFECTIVE TASK: {task}  (a2a_enable={audio2audio_enable}, ref_audio_input={'yes' if ref_audio_input else 'no'})"
+        )
 
         if not self.loaded:
             logger.warning("Checkpoint not loaded, loading checkpoint...")
@@ -1726,15 +1575,16 @@ class ACEStepPipeline:
         start_time = time.time()
 
         random_generators, actual_seeds = self.set_seeds(batch_size, manual_seeds)
-        retake_random_generators, actual_retake_seeds = self.set_seeds(
-            batch_size, retake_seeds
-        )
+        retake_random_generators, actual_retake_seeds = self.set_seeds(batch_size, retake_seeds)
 
         if isinstance(oss_steps, str) and len(oss_steps) > 0:
             oss_steps = list(map(int, oss_steps.split(",")))
         else:
             oss_steps = []
 
+        # Handle None prompt to prevent tokenizer crash
+        if prompt is None:
+            prompt = ""
         texts = [prompt]
         encoder_text_hidden_states, text_attention_mask = self.get_text_embeddings(texts)
         encoder_text_hidden_states = encoder_text_hidden_states.repeat(batch_size, 1, 1)
@@ -1745,27 +1595,17 @@ class ACEStepPipeline:
             encoder_text_hidden_states_null = self.get_text_embeddings_null(texts)
             encoder_text_hidden_states_null = encoder_text_hidden_states_null.repeat(batch_size, 1, 1)
 
-        # not support for released checkpoint
+        # speaker emb (placeholder)
         speaker_embeds = torch.zeros(batch_size, 512).to(self.device).to(self.dtype)
 
-        # 6 lyric
+        # lyrics
         lyric_token_idx = torch.tensor([0]).repeat(batch_size, 1).to(self.device).long()
         lyric_mask = torch.tensor([0]).repeat(batch_size, 1).to(self.device).long()
-        if len(lyrics) > 0:
-            lyric_token_idx = self.tokenize_lyrics(lyrics, debug=debug)
-            lyric_mask = [1] * len(lyric_token_idx)
-            lyric_token_idx = (
-                torch.tensor(lyric_token_idx)
-                .unsqueeze(0)
-                .to(self.device)
-                .repeat(batch_size, 1)
-            )
-            lyric_mask = (
-                torch.tensor(lyric_mask)
-                .unsqueeze(0)
-                .to(self.device)
-                .repeat(batch_size, 1)
-            )
+        if lyrics:  # handles None and empty-string safely
+            lyric_token_idx_list = self.tokenize_lyrics(lyrics, debug=debug)
+            lyric_mask_list = [1] * len(lyric_token_idx_list)
+            lyric_token_idx = torch.tensor(lyric_token_idx_list).unsqueeze(0).to(self.device).repeat(batch_size, 1)
+            lyric_mask = torch.tensor(lyric_mask_list).unsqueeze(0).to(self.device).repeat(batch_size, 1)
 
         if audio_duration <= 0:
             audio_duration = random.uniform(30.0, 240.0)
@@ -1776,7 +1616,6 @@ class ACEStepPipeline:
         start_time = end_time
 
         add_retake_noise = task in ("retake", "repaint", "extend")
-        # retake equal to repaint
         if task == "retake":
             repaint_start = 0
             repaint_end = audio_duration
@@ -1784,56 +1623,31 @@ class ACEStepPipeline:
         src_latents = None
         if task in ("repaint", "edit", "extend"):
             assert src_audio_path is not None, "src_audio_path is required for retake/repaint/extend task"
-            assert os.path.exists(
-                src_audio_path
-            ), f"src_audio_path {src_audio_path} does not exist"
+            assert os.path.exists(src_audio_path), f"src_audio_path {src_audio_path} does not exist"
             src_latents = self.infer_latents(src_audio_path)
         elif src_audio_path is not None:
-            # Handle case where src_audio_path is provided but task doesn't require it
             src_latents = self.infer_latents(src_audio_path)
-        
+
         ref_latents = None
         if ref_audio_input is not None:
-            assert os.path.exists(
-                ref_audio_input
-            ), f"ref_audio_input {ref_audio_input} does not exist"
+            assert os.path.exists(ref_audio_input), f"ref_audio_input {ref_audio_input} does not exist"
             ref_latents = self.infer_latents(ref_audio_input)
 
         if task == "edit":
             texts = [edit_target_prompt]
-            target_encoder_text_hidden_states, target_text_attention_mask = (
-                self.get_text_embeddings(texts)
-            )
-            target_encoder_text_hidden_states = (
-                target_encoder_text_hidden_states.repeat(batch_size, 1, 1)
-            )
-            target_text_attention_mask = target_text_attention_mask.repeat(
-                batch_size, 1
-            )
+            target_encoder_text_hidden_states, target_text_attention_mask = self.get_text_embeddings(texts)
+            target_encoder_text_hidden_states = target_encoder_text_hidden_states.repeat(batch_size, 1, 1)
+            target_text_attention_mask = target_text_attention_mask.repeat(batch_size, 1)
 
-            target_lyric_token_idx = (
-                torch.tensor([0]).repeat(batch_size, 1).to(self.device).long()
-            )
-            target_lyric_mask = (
-                torch.tensor([0]).repeat(batch_size, 1).to(self.device).long()
-            )
-            if len(edit_target_lyrics) > 0:
-                target_lyric_token_idx = self.tokenize_lyrics(
-                    edit_target_lyrics, debug=True
-                )
-                target_lyric_mask = [1] * len(target_lyric_token_idx)
+            target_lyric_token_idx = torch.tensor([0]).repeat(batch_size, 1).to(self.device).long()
+            target_lyric_mask = torch.tensor([0]).repeat(batch_size, 1).to(self.device).long()
+            if edit_target_lyrics:  # handles None and empty-string safely
+                target_lyric_token_idx_list = self.tokenize_lyrics(edit_target_lyrics, debug=True)
+                target_lyric_mask_list = [1] * len(target_lyric_token_idx_list)
                 target_lyric_token_idx = (
-                    torch.tensor(target_lyric_token_idx)
-                    .unsqueeze(0)
-                    .to(self.device)
-                    .repeat(batch_size, 1)
+                    torch.tensor(target_lyric_token_idx_list).unsqueeze(0).to(self.device).repeat(batch_size, 1)
                 )
-                target_lyric_mask = (
-                    torch.tensor(target_lyric_mask)
-                    .unsqueeze(0)
-                    .to(self.device)
-                    .repeat(batch_size, 1)
-                )
+                target_lyric_mask = torch.tensor(target_lyric_mask_list).unsqueeze(0).to(self.device).repeat(batch_size, 1)
 
             target_speaker_embeds = speaker_embeds.clone()
 
@@ -1849,7 +1663,7 @@ class ACEStepPipeline:
                 target_lyric_token_ids=target_lyric_token_idx,
                 target_lyric_mask=target_lyric_mask,
                 src_latents=src_latents,
-                random_generators=retake_random_generators,  # more diversity
+                random_generators=retake_random_generators,
                 infer_steps=infer_step,
                 guidance_scale=guidance_scale,
                 n_min=edit_n_min,
@@ -1897,11 +1711,8 @@ class ACEStepPipeline:
                 seam_seconds=seam_seconds,
                 extend_pad_mode=extend_pad_mode,
                 extend_tile_only=extend_tile_only,
-                extend_edge_bootstrap_only=extend_edge_bootstrap_only,
-                extend_tile_then_repaint=extend_tile_then_repaint,
-                extend_bootstrap_edge_sec=extend_bootstrap_edge_sec,
-                extend_bootstrap_sigma_max=extend_bootstrap_sigma_max,
-                extend_bootstrap_noise_mode=extend_bootstrap_noise_mode,
+                extend_tile_keep_center=extend_tile_keep_center,
+                extend_tile_repaint_pads=extend_tile_repaint_pads,
             )
 
         end_time = time.time()
@@ -1910,13 +1721,12 @@ class ACEStepPipeline:
 
         output_paths = self.latents2audio(
             latents=target_latents,
-            target_wav_duration_second=audio_duration,  # use the value passed in
+            target_wav_duration_second=audio_duration,
             save_path=save_path,
             format=format,
             sample_rate=sample_rate,
         )
 
-        # Clean up memory after generation
         self.cleanup_memory()
 
         end_time = time.time()
@@ -1964,12 +1774,12 @@ class ACEStepPipeline:
             "audio2audio_enable": audio2audio_enable,
             "ref_audio_strength": ref_audio_strength,
             "ref_audio_input": ref_audio_input,
+            "extend_tile_only": extend_tile_only,
+            "extend_tile_keep_center": extend_tile_keep_center,
+            "extend_tile_repaint_pads": extend_tile_repaint_pads,
         }
-        # save input_params_json
         for output_audio_path in output_paths:
-            input_params_json_save_path = output_audio_path.replace(
-                f".{format}", "_input_params.json"
-            )
+            input_params_json_save_path = output_audio_path.replace(f".{format}", "_input_params.json")
             input_params_json["audio_path"] = output_audio_path
             with open(input_params_json_save_path, "w", encoding="utf-8") as f:
                 json.dump(input_params_json, f, indent=4, ensure_ascii=False)
