@@ -900,6 +900,7 @@ class ACEStepPipeline:
         extend_pad_mode="boot_only",
         extend_tile_only=False,
         extend_edge_bootstrap_only=False,   # <--- NEW
+        extend_tile_then_repaint: bool = False,
         # ---- extend bootstrap tuning (new) ----
         extend_bootstrap_edge_sec: float = 2.0,          # how many seconds of edge context to tile from
         extend_bootstrap_sigma_max: float | None = None, # override the sigma_max used inside bootstrap; None -> derive from extend_bootstrap_strength
@@ -913,6 +914,8 @@ class ACEStepPipeline:
         if extend_tile_only and extend_bootstrap:
             logger.info("tile_only=True → forcing extend_bootstrap=False for purity.")
             extend_bootstrap = False
+        if extend_tile_only and extend_edge_bootstrap_only: 
+            extend_edge_bootstrap_only = False  # keep exclusivity
 
         logger.info(
             "cfg_type: {}, guidance_scale: {}, omega_scale: {}".format(
@@ -1177,7 +1180,7 @@ class ACEStepPipeline:
                 
                 # ==== PURE TILE-ONLY FAST PATH ====
                 if extend_tile_only:
-                    # Build left/right purely from edges (no bootstrap, no noise, just tiling + light smoothing + seam ramp)
+                    # Build left/right purely from edges (no bootstrap), then optionally soft-repaint seams
                     def _avg_time(x, k=5):
                         B, C, H, T = x.shape
                         y = x.to(torch.float32).view(B*C, H, T)
@@ -1204,43 +1207,45 @@ class ACEStepPipeline:
                     # mid is untouched original clip
                     mid = x0[..., left_pad: left_pad + src_len]
 
-                    # seam ramp (inside the pads) to avoid clicks
-                    tiled = []
-                    if left_seed is not None:
-                        L = left_pad
-                        if L > 0:
-                            ramp = torch.linspace(1.0, 0.0, steps=L, device=self.device, dtype=self.dtype).view(1,1,1,L)
-                            # blend last L of left_seed toward the first L of mid
-                            # create a transitional segment: near the seam, prefer mid
-                            blend = ramp * left_seed + (1.0 - ramp) * mid[..., :L]
-                            left_seed = torch.cat([left_seed[..., :max(0, L - L)], blend], dim=-1) if L>0 else left_seed
-                        tiled.append(left_seed)
-                    tiled.append(mid)
-                    if right_seed is not None:
-                        R = right_pad
-                        if R > 0:
-                            ramp = torch.linspace(0.0, 1.0, steps=R, device=self.device, dtype=self.dtype).view(1,1,1,R)
-                            # blend first R of right_seed from end of mid
-                            blend = (1.0 - ramp) * mid[..., -R:] + ramp * right_seed
-                            right_seed = torch.cat([blend, right_seed[..., R:]], dim=-1) if R>0 else right_seed
-                        tiled.append(right_seed)
+                    # assemble tile
+                    parts = []
+                    if left_seed  is not None: parts.append(left_seed)
+                    parts.append(mid)
+                    if right_seed is not None: parts.append(right_seed)
+                    z0 = torch.cat(parts, dim=-1)
 
-                    z0 = torch.cat([p for p in tiled if p is not None], dim=-1)
+                    # stat match keeps vocoder stable
+                    z0 = self._match_global_stats(z0, x0)
+                    target_latents = z0.clone()
+                    zt_edit = x0.clone()
 
-                    # global stat match to the padded source (keeps vocoder stable)
-                    def _match_global_stats(z, ref, eps=1e-6):
-                        m_ref = ref.mean(dim=(1,2,3), keepdim=True)
-                        s_ref = ref.std(dim=(1,2,3), keepdim=True) + eps
-                        m_z   = z.mean(dim=(1,2,3), keepdim=True)
-                        s_z   = z.std(dim=(1,2,3), keepdim=True) + eps
-                        return (z - m_z) * (s_ref / s_z) + m_ref
+                    # seam mask (cosine ramps near joins)
+                    repaint_mask = torch.zeros_like(zt_edit)
+                    if left_pad  > 0: repaint_mask[..., :left_pad]    = 1.0
+                    if right_pad > 0: repaint_mask[..., -right_pad:]  = 1.0
+                    ramp_len = int(max(1, round(float(seam_seconds) * fps)))
+                    if left_pad  > 0:
+                        L = min(ramp_len, left_pad)
+                        ramp = torch.linspace(1.0, 0.0, steps=L, device=self.device, dtype=self.dtype).view(1,1,1,L)
+                        repaint_mask[..., left_pad - L:left_pad] = ramp
+                    if right_pad > 0:
+                        L = min(ramp_len, right_pad)
+                        ramp = torch.linspace(0.0, 1.0, steps=L, device=self.device, dtype=self.dtype).view(1,1,1,L)
+                        s = frame_length - right_pad
+                        repaint_mask[..., s:s+L] = ramp
 
-                    target_latents = _match_global_stats(z0, x0)
+                    logger.info(f"[TILE] seeds built → {'REPAINT' if extend_tile_then_repaint else 'NO-REPAINT'} mode")
+                    if not extend_tile_then_repaint:
+                        # legacy fast return
+                        m = float(target_latents.mean().detach().cpu()); s = float(target_latents.std().detach().cpu())
+                        logger.info(f"[TILE-ONLY-PURE] left={left_pad}f right={right_pad}f EDGE={EDGE} → shape={tuple(target_latents.shape)} mean={m:.5f} std={s:.5f}")
+                        return target_latents
 
-                    # Diagnostics: assert we never ran bootstrap
-                    m = float(target_latents.mean().detach().cpu()); s = float(target_latents.std().detach().cpu())
-                    logger.info(f"[TILE-ONLY-PURE] left={left_pad}f right={right_pad}f EDGE={EDGE} → shape={tuple(target_latents.shape)} mean={m:.5f} std={s:.5f}")
-                    return target_latents
+                    # fall-through: repaint just the pads/seams at low sigma (ignore bootstrap)
+                    is_extend = True
+                    is_repaint = True
+                    # n_min is already auto-shifted to low sigma earlier; nothing else needed
+                    # repaint loop below will pick up (x0, z0, repaint_mask, target_latents, zt_edit)
                 # ==== END PURE TILE-ONLY PATH ====
                 
                 # Override EDGE by seconds if requested
@@ -1257,21 +1262,21 @@ class ACEStepPipeline:
 
                 # pick sigma used during bootstrap
                 sigma_for_boot = (1.0 - float(extend_bootstrap_strength)) if extend_bootstrap_sigma_max is None else float(extend_bootstrap_sigma_max)
-                sigma_for_boot = self._safe_cap("extend_bootstrap_sigma_max", sigma_for_boot, 0.05, 0.8)
+                sigma_for_boot = self._safe_cap("extend_bootstrap_sigma_max", sigma_for_boot, 0.05, 0.25)  # tighter range
 
                 def _bootstrap_from_tile(tile_like, want_len, side: str):
                     # reference slice
                     ref_like = tile_like[..., :want_len]
 
                     # choose noise
-                    if extend_bootstrap_noise_mode == "zeros":
-                        noise_like = torch.zeros_like(ref_like)
-                    elif extend_bootstrap_noise_mode == "matched":
+                    if extend_bootstrap_noise_mode == "matched":
                         noise_like = self._match_rms_like(retake_latents[..., :want_len], ref_like)
+                    elif extend_bootstrap_noise_mode == "zeros":
+                        noise_like = torch.zeros_like(ref_like)
                     else:  # "gauss"
                         noise_like = randn_tensor(ref_like.shape, generator=retake_random_generators, device=self.device, dtype=self.dtype)
 
-                    logger.info(f"[DBG] BOOT side={side} a2a={extend_bootstrap_method=='a2a'} using_ref=edge_tile noise={extend_bootstrap_noise_mode} sigma_max={sigma_for_boot:.3f}")
+                    logger.info(f"[DBG] BOOT side={side} using_ref=edge_tile noise={extend_bootstrap_noise_mode} sigma_max={sigma_for_boot:.3f}")
 
                     boot, _, _, _ = self.add_latents_noise(
                         gt_latents=ref_like,
@@ -1280,17 +1285,17 @@ class ACEStepPipeline:
                         scheduler_type=scheduler_type,
                         infer_steps=infer_steps,
                     )
-                    # gentle low-pass to kill crackle from hard tiling
-                    boot = self._avg_time(boot, k=5)
-                    # energy align to ref edge
+
+                    # smooth to kill crackle
+                    boot = self._avg_time(boot, k=9)
                     boot = self._match_rms_like(boot, ref_like)
                     return boot
 
                 left_seed = right_seed = None
 
                 if left_pad > 0:
-                    # mirror the head for continuity then smooth
-                    left_edge = self._avg_time(x0[..., :EDGE].flip(-1), k=5)
+                    # no flip — use wrapped/tiled edges to preserve phase
+                    left_edge = self._avg_time(x0[..., :EDGE], k=9)
                     left_edge_tiled = _tile_edge(left_edge, left_pad)
                     base_seed = _bootstrap_from_tile(left_edge_tiled, left_pad, side="left") if extend_bootstrap else self._match_rms_like(retake_latents[..., :left_pad], left_edge_tiled)
                     # ramp: near seam we stick to edge, far we allow the bootstrap to show
@@ -1302,7 +1307,7 @@ class ACEStepPipeline:
                     left_seed = theta_vec * left_edge_tiled + (1.0 - theta_vec) * base_seed
 
                 if right_pad > 0:
-                    right_edge = self._avg_time(x0[..., -EDGE:], k=5)
+                    right_edge = self._avg_time(x0[..., -EDGE:], k=9)
                     right_edge_tiled = _tile_edge(right_edge, right_pad)
                     base_seed = _bootstrap_from_tile(right_edge_tiled, right_pad, side="right") if extend_bootstrap else self._match_rms_like(retake_latents[..., -right_pad:], right_edge_tiled)
                     theta_near = torch.tensor(min(0.95, max(0.6, float(extend_strength))), device=self.device, dtype=self.dtype)
@@ -1877,6 +1882,7 @@ class ACEStepPipeline:
         extend_pad_mode: str = "boot_only",
         extend_tile_only: bool = False,   # <--- NEW
         extend_edge_bootstrap_only: bool = False,
+        extend_tile_then_repaint: bool = False,
         # ---- extend bootstrap tuning (new) ----
         extend_bootstrap_edge_sec: float = 2.0,
         extend_bootstrap_sigma_max: float | None = None,
@@ -2075,6 +2081,7 @@ class ACEStepPipeline:
                 extend_pad_mode=extend_pad_mode,
                 extend_tile_only=extend_tile_only,
                 extend_edge_bootstrap_only=extend_edge_bootstrap_only,
+                extend_tile_then_repaint=extend_tile_then_repaint,
                 extend_bootstrap_edge_sec=extend_bootstrap_edge_sec,
                 extend_bootstrap_sigma_max=extend_bootstrap_sigma_max,
                 extend_bootstrap_noise_mode=extend_bootstrap_noise_mode,

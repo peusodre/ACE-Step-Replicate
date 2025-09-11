@@ -219,7 +219,7 @@ class Predictor(BasePredictor):
         ),
         seam_seconds: float = Input(
             description="Duration of tapered repaint seam at the join (seconds)",
-            default=0.75, ge=0.1, le=2.0,
+            default=2.0, ge=0.1, le=5.0,
         ),
         extend_pad_mode: str = Input(
             description="How to seed extend pads",
@@ -233,6 +233,28 @@ class Predictor(BasePredictor):
         extend_edge_bootstrap_only: bool = Input(
             description="Extend by edge bootstrap only (no diffusion/inpainting). For diagnostics.",
             default=False,
+        ),
+        extend_tile_then_repaint: bool = Input(
+            description="Tile-only mode with soft repaint on seams (recommended for clean extensions)",
+            default=False,
+        ),
+        # ---- extend bootstrap tuning (new) ----
+        extend_bootstrap_edge_sec: float = Input(
+            description="How many seconds of edge context to tile from (default: 4.0)",
+            default=4.0,
+            ge=0.5,
+            le=10.0,
+        ),
+        extend_bootstrap_sigma_max: float = Input(
+            description="Override sigma_max used in bootstrap (None=derive from strength)",
+            default=None,
+            ge=0.05,
+            le=0.25,
+        ),
+        extend_bootstrap_noise_mode: str = Input(
+            description="Noise mode for bootstrap: 'matched' (recommended), 'zeros', or 'gauss'",
+            default="matched",
+            choices=["zeros", "matched", "gauss"],
         ),
 
         # ---- Style transfer (edit) -------------------------------------------
@@ -444,6 +466,10 @@ class Predictor(BasePredictor):
             "extend_pad_mode": str(extend_pad_mode),
             "extend_tile_only": bool(extend_tile_only),
             "extend_edge_bootstrap_only": bool(extend_edge_bootstrap_only),
+            "extend_tile_then_repaint": bool(extend_tile_then_repaint),
+            "extend_bootstrap_edge_sec": float(extend_bootstrap_edge_sec),
+            "extend_bootstrap_sigma_max": float(extend_bootstrap_sigma_max) if extend_bootstrap_sigma_max is not None else None,
+            "extend_bootstrap_noise_mode": str(extend_bootstrap_noise_mode),
         }
 
         if pipeline_params["src_audio_path"]:
