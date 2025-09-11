@@ -1312,7 +1312,20 @@ class ACEStepPipeline:
                     theta_vec = (theta_near + (theta_far-theta_near)*ramp).view(1,1,1,-1)
                     right_seed = theta_vec * right_edge_tiled + (1.0 - theta_vec) * base_seed
 
-                mid = target_latents[..., left_trim : target_latents.shape[-1] - right_trim]
+                # Center must be the original clip (not noise):
+                mid = x0[..., left_pad : left_pad + src_len]
+                
+                # Sanity logs to verify center is original
+                m_mid, s_mid, _, _ = self._latent_stats(mid)
+                m_xc,  s_xc,  _, _ = self._latent_stats(x0[..., left_pad:left_pad+src_len])
+                logger.info(f"[CHK] mid stats mean={m_mid:.5f} std={s_mid:.5f} vs x_center mean={m_xc:.5f} std={s_xc:.5f}")
+
+                # cosine similarity of mid vs original center (should be ~1.0 pre-diffusion)
+                cos = torch.nn.functional.cosine_similarity(
+                    mid.reshape(1, -1), x0[..., left_pad:left_pad+src_len].reshape(1, -1), dim=1
+                ).item()
+                logger.info(f"[CHK] mid vs orig center cosine={cos:.6f}")
+                
                 parts = ([left_seed] if left_seed is not None else []) + [mid] + ([right_seed] if right_seed is not None else [])
                 z0 = torch.cat(parts, dim=-1)
                 zt_edit = x0.clone()
