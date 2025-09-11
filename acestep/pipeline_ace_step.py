@@ -78,10 +78,14 @@ def _tstats(name, x):
         logger.info(f"[DBG] {name}: None")
         return
     x32 = x.detach().float()
+    if x32.numel() <= 1:
+        v = float(x32.view(-1)[0].cpu())
+        logger.info(f"[DBG] {name}: scalar={v:.5f}")
+        return
     mn = float(x32.min().cpu())
     mx = float(x32.max().cpu())
     me = float(x32.mean().cpu())
-    sd = float(x32.std().cpu())
+    sd = float(x32.std(unbiased=False).cpu())
     rm = float(_rms(x32))
     logger.info(f"[DBG] {name}: shape={tuple(x.shape)} dtype={x.dtype} "
                 f"min={mn:.5f} max={mx:.5f} mean={me:.5f} std={sd:.5f} rms={rm:.5f} ({_db(rm):.2f} dB)")
@@ -940,6 +944,7 @@ class ACEStepPipeline:
             device=self.device,
             timesteps=None,
         )
+        logger.info(f"[SCHED] steps={num_inference_steps} t=[{float(timesteps[0])/1000:.4f}…{float(timesteps[-1])/1000:.4f}]")
         noisy_image = gt_latents * (1 - scheduler.sigma_max) + noise * scheduler.sigma_max
         first = float(timesteps[0]/1000)
         last = float(timesteps[-1]/1000)
@@ -1063,10 +1068,12 @@ class ACEStepPipeline:
         if src_latents is not None:
             # Use MusicDCAE's native sample rate (44.1kHz) for frame calculations
             fps = _frames_per_second(44100)
-            logger.info(f"Using 44.1kHz for frame calculations (MusicDCAE native rate): fps={fps:.6f}")
+            logger.info(f"[AUDIO] latent_fps={fps:.6f} (44.1k-native), decode_sample_rate={sample_rate}")
+            if sample_rate != 44100:
+                logger.warning("[AUDIO] Decoding at non-native SR; resampling occurs downstream.")
         else:
             fps = _frames_per_second(sample_rate)
-            logger.info(f"Using {sample_rate}Hz for frame calculations: fps={fps:.6f}")
+            logger.info(f"[AUDIO] fps={fps:.6f} (decode_sample_rate={sample_rate})")
             
         frame_length = int(duration * fps)
         if src_latents is not None:
@@ -1140,10 +1147,13 @@ class ACEStepPipeline:
                 return None
 
             # Override n_min to ensure low sigma repaint
-            late = _choose_n_min_by_sigma(0.20)
-            if late is not None and late > n_min:
-                logger.info(f"[DBG] overriding n_min {n_min} -> {late} to ensure low sigma repaint")
-                n_min = late
+            TARGET_SIGMA = 0.20
+            late = _choose_n_min_by_sigma(TARGET_SIGMA)
+            if late is not None:
+                late = min(late, num_inference_steps - 2)
+                if late > n_min:
+                    logger.info(f"[REPAINT-PLAN] target_sigma<= {TARGET_SIGMA:.2f} → n_min {n_min} -> {late}")
+                    n_min = late
             
             # Angle (tensor) used for mixing latents
             retake_variance = (
@@ -1554,8 +1564,8 @@ class ACEStepPipeline:
                         scheduler._init_step_index(t)
                         sigma_here = float(scheduler.sigmas[scheduler.step_index].detach().cpu())
                     except Exception:
-                        sigma_here = float(t_i)
-                    logger.info(f"[DBG] repaint n_min={n_min}/{num_inference_steps}  sigma≈{sigma_here:.4f}  retake_frac={float(retake_variance) if isinstance(retake_variance, torch.Tensor)==False else 'tensor'}")
+                        sigma_here = float(t / 1000)
+                    logger.info(f"[REPAINT-START] n_min={n_min}/{num_inference_steps} sigma≈{sigma_here:.4f}")
                     
                     # Key step stats
                     if i in {n_min, n_min+1, end_idx-1, end_idx}:
@@ -1804,7 +1814,9 @@ class ACEStepPipeline:
 
         target_wav = target_wav.float()
         backend = "sox_io" if format.lower() == "ogg" else "soundfile"
-        logger.info(f"Saving audio to {output_path_wav} using backend {backend}")
+        logger.info(f"Saving audio to {output_path_wav} using backend {backend} (format={format})")
+        if format.lower() == "ogg":
+            logger.info(f"[AUDIO] Using sox_io backend for OGG format")
         torchaudio.save(
             output_path_wav, target_wav, sample_rate=sample_rate, format=format, backend=backend
         )
@@ -2193,5 +2205,11 @@ class ACEStepPipeline:
             input_params_json["audio_path"] = output_audio_path
             with open(input_params_json_save_path, "w", encoding="utf-8") as f:
                 json.dump(input_params_json, f, indent=4, ensure_ascii=False)
+            logger.info(f"[OUT] wrote params JSON: {input_params_json_save_path}")
+
+        # Log final outputs
+        for i, output_audio_path in enumerate(output_paths):
+            input_params_json_save_path = output_audio_path.replace(f".{format}", "_input_params.json")
+            logger.info(f"[OUT] audio[{i}]: {output_audio_path} | params: {input_params_json_save_path}")
 
         return output_paths + [input_params_json]
