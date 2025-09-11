@@ -1127,290 +1127,99 @@ class ACEStepPipeline:
                 zt_edit = x0.clone()
                 z0 = repaint_noise
             elif is_extend:
-                to_right_pad_gt_latents = None
-                to_left_pad_gt_latents = None
                 gt_latents = src_latents
                 src_len = gt_latents.shape[-1]
                 max_infer_fame_length = int(240 * fps)
-            
-                # Compute both pads from original length BEFORE any padding
-                target_start_f = repaint_start_frame  # negative for extend-left
-                target_end_f = repaint_end_frame     # > src_len for extend-right
-                
-                left_pad = max(0, -target_start_f)           # how many frames to pad on the left
-                right_pad = max(0, target_end_f - src_len)   # how many frames to pad on the right
-                new_len = src_len + left_pad + right_pad
-                
-                # Cap handling: crop to model limit
-                left_trim = right_trim = 0
+
+                # ---- RIGHT-ONLY EXTEND ----
+                # Ignore negative repaint_start for extension; do not pad the left at all.
+                # Compute desired extension purely from repaint_end.
+                desired_end_f = max(src_len, repaint_end_frame)  # never earlier than src end
+                left_pad  = 0
+                right_pad = max(0, desired_end_f - src_len)
+                new_len   = src_len + right_pad
+
+                # Cap to model length
                 if new_len > max_infer_fame_length:
-                    overflow = new_len - max_infer_fame_length
-                    # Prefer trimming evenly; bias to the bigger side
-                    take_left = min(left_pad, overflow // 2 + overflow % 2)
-                    take_right = min(right_pad, overflow - take_left)
-                    left_trim, right_trim = take_left, take_right
-                    left_pad -= take_left
-                    right_pad -= take_right
-                    new_len = max_infer_fame_length
-                
-                # Now pad both sides in one shot (time axis is last dim)
-                if left_pad or right_pad:
-                    gt_latents = torch.nn.functional.pad(gt_latents, (left_pad, right_pad), "constant", 0)
-                
-                # Update frame_length and repaint frames
+                    right_pad = max_infer_fame_length - src_len
+                    new_len   = src_len + right_pad
+
+                # Single-sided pad (time is last dim)
+                if right_pad > 0:
+                    gt_latents = torch.nn.functional.pad(gt_latents, (0, right_pad), "constant", 0)
+
+                # Update frame_length and repaint frames (only right region is editable)
                 frame_length = new_len
-                repaint_start_frame = left_pad  # start after left padding
-                repaint_end_frame = left_pad + src_len  # end before right padding
-                
-                # Debug log for extend padding with seconds
+                repaint_start_frame = src_len               # start repaint exactly at seam
+                repaint_end_frame   = src_len + right_pad   # repaint only the extension
+
+                # Logs
                 f2s = lambda f: f / fps
-                logger.info(f"[EXTEND] src={src_len}f ({f2s(src_len):.2f}s) left_pad={left_pad}f ({f2s(left_pad):.2f}s) right_pad={right_pad}f ({f2s(right_pad):.2f}s) new_len={frame_length}f ({f2s(frame_length):.2f}s)")
-                
-                logger.info(f"[DBG] is_extend={is_extend}  extend_bootstrap={extend_bootstrap}  method={extend_bootstrap_method}  pad_mode={extend_pad_mode}")
-                logger.info(f"[DBG] trims: left_trim={left_trim} right_trim={right_trim}  mid_len(before concat)={target_latents.shape[-1] - left_trim - right_trim}")
+                logger.info(f"[EXTEND-R] src={src_len}f ({f2s(src_len):.2f}s) right_pad={right_pad}f ({f2s(right_pad):.2f}s) new_len={new_len}f ({f2s(new_len):.2f}s)")
 
-
-                # Build repaint mask in the padded space
+                # Build repaint mask: 0 on original clip, 1 on padded tail, with a short taper at the seam
+                x0 = gt_latents
                 repaint_mask = torch.zeros_like(gt_latents)
-                if left_pad > 0:
-                    repaint_mask[..., :left_pad] = 1.0
-                if right_pad > 0:
-                    repaint_mask[..., -right_pad:] = 1.0
-                x0 = gt_latents  # reference for blending and zt_src construction
-                
-                # ==== PURE TILE-ONLY SEED → REPAINT ====
-                if extend_tile_only:
-                    def _avg_time(x, k=5):
-                        B, C, H, T = x.shape
-                        y = x.to(torch.float32).view(B*C, H, T)
-                        y = torch.nn.functional.avg_pool1d(y, kernel_size=k, stride=1, padding=k//2)
-                        return y.view(B, C, H, T).to(x.dtype)
-
-                    def _tile(edge_chunk, need):
-                        reps = (need + edge_chunk.shape[-1] - 1) // edge_chunk.shape[-1]
-                        return edge_chunk.repeat(1,1,1,reps)[..., :need]
-
-                    EDGE = max(64, int(round(float(extend_bootstrap_edge_sec if 'extend_bootstrap_edge_sec' in locals() else 2.0) * fps)))
-
-                    # build left/right seeds by tiling from edges (no bootstrap)
-                    left_seed  = _avg_time(x0[..., :EDGE].flip(-1), k=5) if left_pad  > 0 else None
-                    right_seed = _avg_time(x0[..., -EDGE:], k=5)         if right_pad > 0 else None
-                    if left_seed  is not None:  left_seed  = _tile(left_seed,  left_pad)
-                    if right_seed is not None:  right_seed = _tile(right_seed, right_pad)
-
-                    # center = original clip
-                    mid = x0[..., left_pad:left_pad + src_len]
-
-                    # seam ramps
-                    tiled = []
-                    if left_seed is not None:
-                        L = left_pad
-                        if L > 0:
-                            ramp = torch.linspace(1.0, 0.0, steps=L, device=self.device, dtype=self.dtype).view(1,1,1,L)
-                            blend = ramp * left_seed + (1.0 - ramp) * mid[..., :L]
-                            left_seed = torch.cat([left_seed[..., :max(0, L - L)], blend], dim=-1) if L>0 else left_seed
-                        tiled.append(left_seed)
-                    tiled.append(mid)
-                    if right_seed is not None:
-                        R = right_pad
-                        if R > 0:
-                            ramp = torch.linspace(0.0, 1.0, steps=R, device=self.device, dtype=self.dtype).view(1,1,1,R)
-                            blend = (1.0 - ramp) * mid[..., -R:] + ramp * right_seed
-                            right_seed = torch.cat([blend, right_seed[..., R:]], dim=-1) if R>0 else right_seed
-                        tiled.append(right_seed)
-
-                    # concatenated tiled seed across padded length
-                    z0 = torch.cat([p for p in tiled if p is not None], dim=-1)
-
-                    # match global stats to padded source
-                    z0 = self._match_global_stats(z0, x0)
-                    target_latents = z0.clone()
-                    zt_edit = x0.clone()
-
-                    # soft repaint mask (pads=1, tapered near seams)
-                    repaint_mask = torch.zeros_like(zt_edit)
-                    if left_pad  > 0: repaint_mask[..., :left_pad] = 1.0
-                    if right_pad > 0: repaint_mask[..., -right_pad:] = 1.0
-
-                    ramp_len = int(max(1, round(float(seam_seconds) * fps)))
-                    if left_pad > 0:
-                        L = min(ramp_len, left_pad)
-                        ramp = torch.linspace(1.0, 0.0, steps=L, device=self.device, dtype=self.dtype).view(1,1,1,L)
-                        repaint_mask[..., left_pad - L : left_pad] = ramp
-                    if right_pad > 0:
-                        L = min(ramp_len, right_pad)
-                        ramp = torch.linspace(0.0, 1.0, steps=L, device=self.device, dtype=self.dtype).view(1,1,1,L)
-                        s = frame_length - right_pad
-                        repaint_mask[..., s : s + L] = ramp
-
-                    # mark as repaint/extend and then FALL THROUGH to the main diffusion loop
-                    is_repaint = True
-                    # (do not return; we will continue into the for-loop to repaint)
-                    logger.info(f"[TILE→REPAINT] Using tile-only seed (EDGE={EDGE}) and proceeding to repaint; no bootstrap.")
-                # ==== END TILE-ONLY SEED → REPAINT ====
-                
-                if not extend_tile_only:
-                    # Override EDGE by seconds if requested
-                    if extend_bootstrap_edge_sec is not None and extend_bootstrap_edge_sec > 0:
-                        EDGE = max(64, int(round(float(extend_bootstrap_edge_sec) * fps)))
-                    else:
-                        EDGE = int(min(max(128, x0.shape[-1] // 8), max(128, int(3.0 * fps))))
-                        EDGE = max(128, EDGE)
-                    logger.info(f"[BOOT] EDGE frames={EDGE} (~{EDGE/float(max(1.0,fps)):.2f}s)")
-
-                    def _tile_edge(edge_chunk, need):
-                        reps = (need + edge_chunk.shape[-1] - 1) // edge_chunk.shape[-1]
-                        return edge_chunk.repeat(1,1,1,reps)[..., :need]
-
-                    # pick sigma used during bootstrap
-                    sigma_for_boot = (1.0 - float(extend_bootstrap_strength)) if extend_bootstrap_sigma_max is None else float(extend_bootstrap_sigma_max)
-                    sigma_for_boot = self._safe_cap("extend_bootstrap_sigma_max", sigma_for_boot, 0.05, 0.25)  # tighter range
-
-                    def _bootstrap_from_tile(tile_like, want_len, side: str):
-                        # reference slice
-                        ref_like = tile_like[..., :want_len]
-
-                        # choose noise
-                        if extend_bootstrap_noise_mode == "matched":
-                            noise_like = self._match_rms_like(retake_latents[..., :want_len], ref_like)
-                        elif extend_bootstrap_noise_mode == "zeros":
-                            noise_like = torch.zeros_like(ref_like)
-                        else:  # "gauss"
-                            noise_like = randn_tensor(ref_like.shape, generator=retake_random_generators, device=self.device, dtype=self.dtype)
-
-                        logger.info(f"[DBG] BOOT side={side} using_ref=edge_tile noise={extend_bootstrap_noise_mode} sigma_max={sigma_for_boot:.3f}")
-
-                        boot, _, _, _ = self.add_latents_noise(
-                            gt_latents=ref_like,
-                            sigma_max=sigma_for_boot,
-                            noise=noise_like,
-                            scheduler_type=scheduler_type,
-                            infer_steps=infer_steps,
-                        )
-
-                        # smooth to kill crackle
-                        boot = self._avg_time(boot, k=9)
-                        boot = self._match_rms_like(boot, ref_like)
-                        return boot
-
-                    left_seed = right_seed = None
-
-                    if left_pad > 0:
-                        # no flip — use wrapped/tiled edges to preserve phase
-                        left_edge = self._avg_time(x0[..., :EDGE], k=9)
-                        left_edge_tiled = _tile_edge(left_edge, left_pad)
-                        base_seed = _bootstrap_from_tile(left_edge_tiled, left_pad, side="left") if extend_bootstrap else self._match_rms_like(retake_latents[..., :left_pad], left_edge_tiled)
-                        # ramp: near seam we stick to edge, far we allow the bootstrap to show
-                        theta_near = torch.tensor(min(0.95, max(0.6, float(extend_strength))), device=self.device, dtype=self.dtype)
-                        theta_far  = torch.tensor(0.20 if ((left_pad+right_pad)/max(1.0,fps)) >= 15.0 else 0.30, device=self.device, dtype=self.dtype)
-                        t = torch.linspace(0,1,steps=left_pad, device=self.device, dtype=self.dtype)
-                        ramp = 0.5*(1.0 - torch.cos(t*math.pi))  # 0->1
-                        theta_vec = (theta_near + (theta_far-theta_near)*ramp).view(1,1,1,-1)
-                        left_seed = theta_vec * left_edge_tiled + (1.0 - theta_vec) * base_seed
-
-                    if right_pad > 0:
-                        right_edge = self._avg_time(x0[..., -EDGE:], k=9)
-                        right_edge_tiled = _tile_edge(right_edge, right_pad)
-                        base_seed = _bootstrap_from_tile(right_edge_tiled, right_pad, side="right") if extend_bootstrap else self._match_rms_like(retake_latents[..., -right_pad:], right_edge_tiled)
-                        theta_near = torch.tensor(min(0.95, max(0.6, float(extend_strength))), device=self.device, dtype=self.dtype)
-                        theta_far  = torch.tensor(0.20 if ((left_pad+right_pad)/max(1.0,fps)) >= 15.0 else 0.30, device=self.device, dtype=self.dtype)
-                        t = torch.linspace(0,1,steps=right_pad, device=self.device, dtype=self.dtype)
-                        ramp = 0.5*(1.0 - torch.cos(t*math.pi))
-                        theta_vec = (theta_near + (theta_far-theta_near)*ramp).view(1,1,1,-1)
-                        right_seed = theta_vec * right_edge_tiled + (1.0 - theta_vec) * base_seed
-
-                    # Center must be the original clip (not noise):
-                    mid = x0[..., left_pad : left_pad + src_len]
-                    
-                    # Sanity logs to verify center is original
-                    m_mid, s_mid, _, _ = self._latent_stats(mid)
-                    m_xc,  s_xc,  _, _ = self._latent_stats(x0[..., left_pad:left_pad+src_len])
-                    logger.info(f"[CHK] mid stats mean={m_mid:.5f} std={s_mid:.5f} vs x_center mean={m_xc:.5f} std={s_xc:.5f}")
-
-                    # cosine similarity of mid vs original center (should be ~1.0 pre-diffusion)
-                    cos = torch.nn.functional.cosine_similarity(
-                        mid.reshape(1, -1), x0[..., left_pad:left_pad+src_len].reshape(1, -1), dim=1
-                    ).item()
-                    logger.info(f"[CHK] mid vs orig center cosine={cos:.6f}")
-                    
-                    parts = ([left_seed] if left_seed is not None else []) + [mid] + ([right_seed] if right_seed is not None else [])
-                    z0 = torch.cat(parts, dim=-1)
-                    zt_edit = x0.clone()
-
-                    # final global stat match (prevents vocoder crackle from scale drift)
-                    z0 = self._match_global_stats(z0, x0)
-                    target_latents = z0.clone()
-
-                    m,s,mn,mx = self._latent_stats(z0)
-                    logger.info(f"[BOOT] z0 stats mean={m:.5f} std={s:.5f} min={mn:.5f} max={mx:.5f}  rms={self._latent_rms(z0):.6f}")
-                else:
-                    logger.info("[TILE→REPAINT] Skipping bootstrap because extend_tile_only=True.")
-                
-                def _rms_t(x): 
-                    # RMS over last dimension (time)
-                    return float(torch.sqrt(torch.clamp((x * x).mean(dim=-1), 1e-6)).mean().detach().cpu())
-                
-                logger.info(f"[DBG] seeds: left_seed={'none' if left_seed is None else tuple(left_seed.shape)} right_seed={'none' if right_seed is None else tuple(right_seed.shape)} z0_shape={tuple(z0.shape)} x0_shape={tuple(x0.shape)}")
-                logger.info(f"[DBG] energy: rms(x0)={_rms_t(x0):.6f} rms(z0)={_rms_t(z0):.6f}")
-                
-                assert z0.shape[-1] == x0.shape[-1], "[ASSERT] z0/x0 length mismatch"
-                
-                # Final stat match to keep decoder happy
-                def _match_stats(z, ref, eps=1e-6):
-                    m_ref = ref.mean(dim=(1, 2, 3), keepdim=True)
-                    s_ref = ref.std(dim=(1, 2, 3), keepdim=True) + eps
-                    m_z   = z.mean(dim=(1, 2, 3), keepdim=True)
-                    s_z   = z.std(dim=(1, 2, 3), keepdim=True) + eps
-                    return (z - m_z) * (s_ref / s_z) + m_ref
-
-                # --- EDGE-BOOTSTRAP-ONLY FAST PATH (AI-seeded edges, no diffusion) ---
-                if is_extend and extend_edge_bootstrap_only:
-                    logger.info("[BOOTSTRAP-ONLY] returning edge-conditioned bootstrap latents without diffusion/inpainting.")
-                    return target_latents  # already stats-matched
-
-                # --- Soft seam: make a tapered repaint mask near the seam to avoid a hard boundary ---
-                # Start from binary (pad=1, original=0), then taper `seam_seconds` near both seams inside the pad
-                repaint_mask = torch.zeros_like(zt_edit)
-                if left_pad > 0:
-                    repaint_mask[..., :left_pad] = 1.0
                 if right_pad > 0:
                     repaint_mask[..., -right_pad:] = 1.0
 
+                # ---- TILE-ONLY SEED FOR THE TAIL (no bootstrap) ----
+                # Use last EDGE seconds as a motif; repeat to fill the extension
+                def _avg_time(x, k=5):
+                    B, C, H, T = x.shape
+                    y = x.to(torch.float32).view(B*C, H, T)
+                    y = torch.nn.functional.avg_pool1d(y, kernel_size=k, stride=1, padding=k//2)
+                    return y.view(B, C, H, T).to(x.dtype)
+
+                def _tile(edge_chunk, need):
+                    reps = (need + edge_chunk.shape[-1] - 1) // edge_chunk.shape[-1]
+                    return edge_chunk.repeat(1,1,1,reps)[..., :need]
+
+                EDGE = max(64, int(round(float(extend_bootstrap_edge_sec if 'extend_bootstrap_edge_sec' in locals() else 2.0) * fps)))
+                mid  = x0[..., :src_len]  # original clip unchanged
+
+                right_seed = None
+                if right_pad > 0:
+                    # take last EDGE frames (no flip), smooth a little, tile
+                    right_edge = _avg_time(x0[..., src_len-EDGE:src_len], k=7) if src_len >= EDGE else _avg_time(x0[..., :src_len], k=7)
+                    right_seed = _tile(right_edge, right_pad)
+
+                    # cosine cross-fade at the seam to avoid a step
+                    R = right_pad
+                    fade = torch.linspace(0.0, 1.0, steps=min(int(round(seam_seconds * fps)), R), device=self.device, dtype=self.dtype)
+                    # Align fade to the front of the pad region
+                    fade_len = fade.numel()
+                    if fade_len > 0:
+                        # blend last fade_len frames of mid into first fade_len of right_seed
+                        cross_A = mid[..., -fade_len:]
+                        cross_B = right_seed[..., :fade_len]
+                        cross   = (1.0 - fade).view(1,1,1,-1) * cross_A + fade.view(1,1,1,-1) * cross_B
+                        right_seed = torch.cat([cross, right_seed[..., fade_len:]], dim=-1)
+
+                # Concatenate: original mid + tiled tail
+                parts = [mid]
+                if right_seed is not None:
+                    parts.append(right_seed)
+                z0 = torch.cat(parts, dim=-1)
+
+                # RMS + global distribution match keeps vocoder stable
+                z0 = self._match_rms_like(z0, x0)
+                z0 = self._match_global_stats(z0, x0)
+
+                target_latents = z0.clone()
+                zt_edit = x0.clone()
+
+                # soften the repaint mask at seam (on the right only)
                 ramp_len = int(max(1, round(float(seam_seconds) * fps)))
-                if left_pad > 0:
-                    L = min(ramp_len, left_pad)
-                    ramp = torch.linspace(1.0, 0.0, steps=L, device=self.device, dtype=self.dtype).view(1, 1, 1, L)
-                    repaint_mask[..., left_pad - L : left_pad] = ramp  # 1 -> 0 towards the seam
                 if right_pad > 0:
                     L = min(ramp_len, right_pad)
-                    ramp = torch.linspace(0.0, 1.0, steps=L, device=self.device, dtype=self.dtype).view(1, 1, 1, L)
+                    ramp = torch.linspace(0.0, 1.0, steps=L, device=self.device, dtype=self.dtype).view(1,1,1,L)
                     s = frame_length - right_pad
-                    repaint_mask[..., s : s + L] = ramp  # 0 -> 1 leaving the seam
-                # (no frequency tilt — match inpaint behavior)
-                
-                nz = int((repaint_mask > 0).sum().item())
-                logger.info(f"[DBG] repaint_mask nonzero={nz} ({nz / repaint_mask.numel():.4%})  ramp_len={ramp_len}")
-                
-                assert (repaint_mask[..., :left_pad].mean() >= 0.5 if left_pad>0 else True), "[ASSERT] left pad mask not set"
-                assert (repaint_mask[..., -right_pad:].mean() >= 0.5 if right_pad>0 else True), "[ASSERT] right pad mask not set"
+                    repaint_mask[..., s : s + L] = ramp
 
-                # Match global stats of z0 to the (padded) source latents to keep distributions compatible
-                def _match_stats(z, ref, eps=1e-6):
-                    m_ref = ref.mean(dim=(1, 2, 3), keepdim=True)
-                    s_ref = ref.std(dim=(1, 2, 3), keepdim=True) + eps
-                    m_z = z.mean(dim=(1, 2, 3), keepdim=True)
-                    s_z = z.std(dim=(1, 2, 3), keepdim=True) + eps
-                    return (z - m_z) * (s_ref / s_z) + m_ref
-
-                z0 = _match_stats(z0, x0)
-                target_latents = z0.clone()
-
-                if not extend_tile_only:
-                    logger.info(f"[EXTEND] (improved) EDGE={EDGE}  ramp_len={ramp_len}  "
-                                f"theta_near={float(theta_near):.2f}  theta_far={float(theta_far):.2f}")
-                else:
-                    logger.info(f"[EXTEND] (tile→repaint) EDGE={EDGE}  ramp_len={ramp_len}")
-                logger.info(f"[EXTEND] x0.shape={x0.shape}  z0.shape={z0.shape}  target_latents.shape={target_latents.shape}")
+                is_repaint = True
+                is_extend  = True
+                logger.info(f"[TILE→REPAINT-R] right-only seed (EDGE={EDGE}) → repaint tail; left kept intact.")
 
         if audio2audio_enable and ref_latents is not None:
             logger.info(
