@@ -359,8 +359,6 @@ class ACEStepPipeline:
                 else save_path
             )
 
-        # torchaudio.save no longer accepts a 'backend=' kwarg.
-        # Also, MP3/OGG may be unavailable depending on libsndfile/ffmpeg in the image.
         fmt = (format or "wav").lower()
         try:
             if fmt in ("wav", "ogg"):
@@ -377,12 +375,10 @@ class ACEStepPipeline:
                 out = out.rsplit(".", 1)[0] + ".wav"
                 torchaudio.save(out, wav.float(), sample_rate=sample_rate, format="wav")
         except Exception as e:
-            # Final safety net: always try WAV
             logger.warning(f"Primary save failed ({e}); attempting WAV fallback.")
             try:
                 out = out.rsplit(".", 1)[0] + ".wav"
             except Exception:
-                # If 'out' has no extension
                 out = f"{out}.wav"
             torchaudio.save(out, wav.float(), sample_rate=sample_rate, format="wav")
 
@@ -463,17 +459,29 @@ class ACEStepPipeline:
 
             repaint_mask[..., s_f:e_f] = 1.0
 
-            # seed repaint region with a mix of two noises
-            noise_a = target_latents
+            # retake_variance α∈[0,1] controls deviation from source:
+            # seed = (1-α)*x0 + α*noise_mix  inside the repaint window
+            alpha = float(retake_variance)
+            base_seed = x0.clone()  # source latents
+            noise_a = target_latents  # current random init
             noise_b = randn_tensor(
                 shape=target_latents.shape,
                 generator=retake_random_generators,
                 device=self.device,
                 dtype=self.dtype,
             )
-            angle = torch.tensor(float(retake_variance) * math.pi / 2, device=self.device, dtype=self.dtype)
-            repaint_noise = torch.cos(angle) * noise_a + torch.sin(angle) * noise_b
-            z0 = torch.where(repaint_mask == 1.0, repaint_noise, target_latents)
+            angle = torch.tensor(alpha * math.pi / 2, device=self.device, dtype=self.dtype)
+            noise_mix = torch.cos(angle) * noise_a + torch.sin(angle) * noise_b
+            seed_mix = (1.0 - alpha) * base_seed + alpha * noise_mix
+            z0 = torch.where(repaint_mask == 1.0, seed_mix, target_latents)
+
+            # Debug: how much perturbation vs source are we injecting in-window?
+            with torch.no_grad():
+                m = (repaint_mask > 0).to(self.dtype)
+                denom = m.sum().clamp_min(1.0)
+                delta = ((z0 - x0) * m).pow(2).sum() / denom
+                delta_rms = torch.sqrt(torch.clamp(delta, 1e-12)).item()
+                logger.info(f"[REPAINT] noise alpha={alpha:.3f}  window_rms={_db(delta_rms):.1f} dB")
 
             logger.info(f"[REPAINT] frames=({s_f},{e_f}) / {Tsrc} (≈{s_f/fps_out:.2f}s→{e_f/fps_out:.2f}s)")
 
@@ -539,40 +547,45 @@ class ACEStepPipeline:
                 if right_pad > 0:
                     repaint_mask[..., seam_pad_start : seam_pad_start + right_pad] = 1.0
 
-                # 5) OPTIONAL variation seed for the extended tail:
-                # Mix two noises in the *tail only*, controlled by `retake_variance` (aka repaint_strength).
-                # This gives you a knob for "how different" the continuation starts before denoising.
-                if float(retake_variance) > 0.0:
-                    tail_start = Tsrc
-                    tail_end   = Tsrc + right_pad
-                    tail_slice = slice(tail_start, tail_end)
+                # Mix for *tail only*, controlled by α=retake_variance, relative to the tiled edge:
+                # tail_seed = (1-α)*tiled + α*noise_mix
+                alpha = float(retake_variance)
+                tail_start = Tsrc
+                tail_end   = Tsrc + right_pad
+                tail_slice = slice(tail_start, tail_end)
 
-                    # noise_a = current tail seed (tiled/crossfaded)
-                    noise_a = target_latents[..., tail_slice]
-                    # noise_b = fresh Gaussian noise
+                tiled_seed = target_latents[..., tail_slice]  # current tiled/crossfaded seed
+                if alpha > 0.0:
                     noise_b = randn_tensor(
-                        shape=noise_a.shape,
+                        shape=tiled_seed.shape,
                         generator=retake_random_generators,
                         device=self.device,
                         dtype=self.dtype,
                     )
-                    angle = torch.tensor(float(retake_variance) * math.pi / 2,
-                                         device=self.device, dtype=self.dtype)
-                    tail_seed = torch.cos(angle) * noise_a + torch.sin(angle) * noise_b
+                    angle = torch.tensor(alpha * math.pi / 2, device=self.device, dtype=self.dtype)
+                    noise_mix = torch.cos(angle) * tiled_seed + torch.sin(angle) * noise_b
+                    tail_seed = (1.0 - alpha) * tiled_seed + alpha * noise_mix
 
-                    # Gentle ramp-in of the noise right after the seam to avoid a bump
+                    # Gentle ramp-in of the perturbation right after the seam
                     pre_noise_ramp = min(int(round(0.25 * seam_seconds * fps_src)), right_pad)
                     if pre_noise_ramp > 0:
                         fade = torch.linspace(0.0, 1.0, steps=pre_noise_ramp,
                                               device=self.device, dtype=self.dtype)[None, None, None, :]
                         tail_seed[..., :pre_noise_ramp] = (
-                            (1.0 - fade) * noise_a[..., :pre_noise_ramp] +
+                            (1.0 - fade) * tiled_seed[..., :pre_noise_ramp] +
                             fade * tail_seed[..., :pre_noise_ramp]
                         )
+                else:
+                    tail_seed = tiled_seed
 
-                    # Apply the mixed-noise seed to the tail in both target_latents and z0
-                    target_latents[..., tail_slice] = tail_seed
-                    z0[...,            tail_slice] = tail_seed
+                # Apply the mixed seed to the tail in both target_latents and z0
+                target_latents[..., tail_slice] = tail_seed
+                z0[...,            tail_slice] = tail_seed
+
+                # Debug: perturbation vs the tiled seed (not vs zeros)
+                with torch.no_grad():
+                    delta = (tail_seed - tiled_seed).pow(2).mean().sqrt().item()
+                    logger.info(f"[EXTEND] noise alpha={alpha:.3f}  tail_rms={_db(delta):.1f} dB")
 
                 logger.info(
                     f"[EXTEND] src={Tsrc}f (≈{Tsrc/fps_src:.2f}s) → new={frame_length}f "
@@ -700,22 +713,20 @@ class ACEStepPipeline:
     # ---- public API ----------------------------------------------------------
 
     def load_lora(self, lora_name_or_path: str, lora_weight: float):
-        # no-op if none
         if lora_name_or_path == "none":
             if self.lora_path != "none":
                 self.ace_step_transformer.unload_lora()
                 self.lora_path = "none"
             return
 
-        # already active with same weight?
         if lora_name_or_path == self.lora_path and abs(lora_weight - self.lora_weight) < 1e-6:
             return
 
-        # load/update
             if not os.path.exists(lora_name_or_path):
                 lora_download_path = snapshot_download(lora_name_or_path, cache_dir=self.checkpoint_dir)
             else:
                 lora_download_path = lora_name_or_path
+
             if self.lora_path != "none":
                 self.ace_step_transformer.unload_lora()
 
