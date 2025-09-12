@@ -517,37 +517,66 @@ class ACEStepPipeline:
 
                 target_latents = z0.clone()
 
-                # 4) two-sided repaint mask around the seam
-                post_seconds = seam_seconds
-                pre_seconds  = min(seam_seconds * 0.5, (Tsrc / fps_src) * 0.25)
-                alpha_inside = 0.4  # gentle authority inside source
-
-                pre_L  = min(int(round(pre_seconds  * fps_src)), Tsrc)
-                post_L = min(int(round(post_seconds * fps_src)), right_pad)
+                # 4) Seam-aware repaint mask:
+                # Make the mask reach 1.0 *at the last source frame* and keep 1.0 for all padded frames.
+                # This ensures the denoiser is already at full authority when the tail begins.
+                pre_seconds = max(0.0, seam_seconds)
+                pre_L = min(int(round(pre_seconds * fps_src)), Tsrc)
 
                 seam_src_start = Tsrc - pre_L
                 seam_pad_start = Tsrc
 
+                # Pre-seam ramp **inside the source**: 0 → 1 so the final source frame is exactly 1.0
                 if pre_L > 0:
-                    pre_ramp = torch.linspace(0.0, float(alpha_inside), steps=pre_L,
-                                              device=self.device, dtype=self.dtype)[None, None, None, :]
+                    pre_ramp = torch.linspace(
+                        0.0, 1.0, steps=pre_L, device=self.device, dtype=self.dtype
+                    )[None, None, None, :]
                     repaint_mask[..., seam_src_start:Tsrc] = torch.maximum(
                         repaint_mask[..., seam_src_start:Tsrc], pre_ramp
                     )
 
-                if post_L > 0:
-                    post_ramp = torch.linspace(0.0, 1.0, steps=post_L,
-                                               device=self.device, dtype=self.dtype)[None, None, None, :]
-                    repaint_mask[..., seam_pad_start:seam_pad_start + post_L] = torch.maximum(
-                        repaint_mask[..., seam_pad_start:seam_pad_start + post_L], post_ramp
-                    )
+                # Post-seam (the padded tail): full repaint immediately
+                if right_pad > 0:
+                    repaint_mask[..., seam_pad_start : seam_pad_start + right_pad] = 1.0
 
-                if right_pad > post_L:
-                    repaint_mask[..., seam_pad_start + post_L : Tsrc + right_pad] = 1.0
+                # 5) OPTIONAL variation seed for the extended tail:
+                # Mix two noises in the *tail only*, controlled by `retake_variance` (aka repaint_strength).
+                # This gives you a knob for "how different" the continuation starts before denoising.
+                if float(retake_variance) > 0.0:
+                    tail_start = Tsrc
+                    tail_end   = Tsrc + right_pad
+                    tail_slice = slice(tail_start, tail_end)
+
+                    # noise_a = current tail seed (tiled/crossfaded)
+                    noise_a = target_latents[..., tail_slice]
+                    # noise_b = fresh Gaussian noise
+                    noise_b = randn_tensor(
+                        shape=noise_a.shape,
+                        generator=retake_random_generators,
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
+                    angle = torch.tensor(float(retake_variance) * math.pi / 2,
+                                         device=self.device, dtype=self.dtype)
+                    tail_seed = torch.cos(angle) * noise_a + torch.sin(angle) * noise_b
+
+                    # Gentle ramp-in of the noise right after the seam to avoid a bump
+                    pre_noise_ramp = min(int(round(0.25 * seam_seconds * fps_src)), right_pad)
+                    if pre_noise_ramp > 0:
+                        fade = torch.linspace(0.0, 1.0, steps=pre_noise_ramp,
+                                              device=self.device, dtype=self.dtype)[None, None, None, :]
+                        tail_seed[..., :pre_noise_ramp] = (
+                            (1.0 - fade) * noise_a[..., :pre_noise_ramp] +
+                            fade * tail_seed[..., :pre_noise_ramp]
+                        )
+
+                    # Apply the mixed-noise seed to the tail in both target_latents and z0
+                    target_latents[..., tail_slice] = tail_seed
+                    z0[...,            tail_slice] = tail_seed
 
                 logger.info(
                     f"[EXTEND] src={Tsrc}f (≈{Tsrc/fps_src:.2f}s) → new={frame_length}f "
-                    f"(+{right_pad}f), seam_pre={pre_L}f, seam_post={post_L}f, alpha_inside={alpha_inside}"
+                    f"(+{right_pad}f), seam_pre={pre_L}f (mask hits 1.0 at seam)"
                 )
             else:
                 repaint_mask = torch.zeros_like(x0)

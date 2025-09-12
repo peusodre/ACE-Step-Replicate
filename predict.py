@@ -79,7 +79,7 @@ class Predictor(BasePredictor):
         inpaint_end_time: float = Input(default=0.0, ge=0.0),
         repaint_strength: float = Input(
             default=0.5, ge=0.0, le=1.0,
-            description="Higher = stronger change in the repainted window"
+            description="Strength of change. Applies to repaint and extend."
         ),
 
         # ---- extend controls (active when task='extend') ---------------------
@@ -95,7 +95,7 @@ class Predictor(BasePredictor):
 
         # ---- diffusion / guidance -------------------------------------------
         infer_steps: int = Input(default=60, ge=20, le=120),
-        scheduler_type: str = Input(default="euler", choices=["euler", "heun", "pingpong"]),
+        scheduler_type: str = Input(default="heun", choices=["euler", "heun", "pingpong"]),
         cfg_type: str = Input(default="apg", choices=["apg", "cfg", "cfg_star"]),
         guidance_scale: float = Input(default=12.0, ge=1.0, le=30.0),
         omega_scale: float = Input(default=8.0, ge=1.0, le=20.0),
@@ -104,11 +104,8 @@ class Predictor(BasePredictor):
 
         # ---- seeds -----------------------------------------------------------
         seed: int = Input(default=None),
-        variation_seed: int = Input(default=None),
-        variation_strength: float = Input(
-            default=0.0, ge=0.0, le=1.0,
-            description="If >0 (and not repaint), used as retake variance."
-        ),
+        retake_seed: int = Input(default=None, description="Seed for retake/variation generation"),
+        # NOTE: reuse repaint_strength for extend as well (single mental model)
 
         # ---- LoRA / output ---------------------------------------------------
         lora_name_or_path: str = Input(default="none"),
@@ -129,7 +126,7 @@ class Predictor(BasePredictor):
 
         # seeds
         manual_seeds = [seed] if seed is not None else None
-        retake_seeds = [variation_seed] if variation_seed is not None else manual_seeds
+        retake_seeds = [retake_seed] if retake_seed is not None else manual_seeds
 
         # build repaint window
         if task == "extend":
@@ -146,11 +143,8 @@ class Predictor(BasePredictor):
             guidance_scale_eff = guidance_scale
             min_cfg_eff = min_guidance_scale
 
-        # choose retake variance
-        if task == "repaint":
-            retake_variance = float(repaint_strength)
-        else:
-            retake_variance = float(variation_strength) if variation_strength > 0 else 0.3
+        # One knob for both: repaint_strength drives tail variation on extend, and repaint intensity on repaint
+        retake_variance = float(repaint_strength)
 
         # call the slim pipeline
         kwargs = dict(
@@ -176,7 +170,7 @@ class Predictor(BasePredictor):
 
             manual_seeds=manual_seeds,
             retake_seeds=retake_seeds,
-            retake_variance=float(retake_variance),
+            retake_variance=retake_variance,
 
             seam_seconds=float(seam_seconds),
             extend_bootstrap_edge_sec=float(extend_bootstrap_edge_sec),
