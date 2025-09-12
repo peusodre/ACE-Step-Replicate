@@ -617,17 +617,30 @@ class ACEStepPipeline:
         momentum = MomentumBuffer()
 
         # repaint strength → choose step index where masked ODE-like blending begins
-        # (no sigma capping/override; this is the only place we decide "when to start")
         repaint_frac = float(retake_variance)
         n_min = max(1, min(int(infer_steps * (1 - repaint_frac)), infer_steps - 2))
 
+        # ORIGINAL-STYLE flow control flags
+        is_repaint_mode = (task == "repaint") or is_extend
+        alpha = float(retake_variance)
+
+        # OPTIONAL UX guard to avoid surprises when α=0 (not in upstream):
+        # if is_repaint_mode and alpha == 0.0:
+        #     logger.info("retake_variance=0 → bypass repaint/extend; returning source unchanged.")
+        #     return x0
+
         # diffusion
         for i, t in tqdm(enumerate(timesteps), total=num_steps, disable=(num_steps <= 12)):
+
+            # ----- ORIGINAL BEHAVIOR: skip everything before repaint starts -----
+            if is_repaint_mode and i < n_min:
+                continue
+
             latents = target_latents
             in_guidance = (start_idx <= i < end_idx)
 
             if in_guidance:
-                # possibly decaying CFG during the active guidance window
+                # (unchanged guidance code)
                 if guidance_interval_decay > 0:
                     den = max(1, (end_idx - start_idx - 1))
                     prog = (i - start_idx) / den
@@ -638,36 +651,28 @@ class ACEStepPipeline:
                 timestep = t.expand(latents.shape[0])
                 out_len = latents.shape[-1]
 
-                # cond / uncond passes
                 cond = self.ace_step_transformer.decode(
                     hidden_states=latents, attention_mask=attn_mask,
                     encoder_hidden_states=enc_states, encoder_hidden_mask=enc_mask,
                     output_length=out_len, timestep=timestep
-                    ).sample
+                ).sample
                 uncond = self.ace_step_transformer.decode(
                     hidden_states=latents, attention_mask=attn_mask,
                     encoder_hidden_states=enc_states_null, encoder_hidden_mask=enc_mask,
                     output_length=out_len, timestep=timestep
-                    ).sample
+                ).sample
 
                 if cfg_type == "apg":
-                    noise = apg_forward(
-                        pred_cond=cond, pred_uncond=uncond,
-                        guidance_scale=cfg_now, momentum_buffer=momentum
-                    )
+                    noise = apg_forward(pred_cond=cond, pred_uncond=uncond,
+                                        guidance_scale=cfg_now, momentum_buffer=momentum)
                 elif cfg_type == "cfg":
-                    noise = cfg_forward(
-                        cond_output=cond, uncond_output=uncond, cfg_strength=cfg_now
-                    )
+                    noise = cfg_forward(cond_output=cond, uncond_output=uncond, cfg_strength=cfg_now)
                 elif cfg_type == "cfg_star":
-                    noise = cfg_zero_star(
-                        noise_pred_with_cond=cond, noise_pred_uncond=uncond,
-                        guidance_scale=cfg_now, i=i, zero_steps=1, use_zero_init=True
-                    )
+                    noise = cfg_zero_star(noise_pred_with_cond=cond, noise_pred_uncond=uncond,
+                                          guidance_scale=cfg_now, i=i, zero_steps=1, use_zero_init=True)
                 else:
-                    noise = cond  # fallback
+                    noise = cond
             else:
-                # unconditional evolution (no explicit guidance mixing)
                 timestep = t.expand(latents.shape[0])
                 noise = self.ace_step_transformer.decode(
                     hidden_states=latents, attention_mask=attn_mask,
@@ -675,24 +680,30 @@ class ACEStepPipeline:
                     output_length=latents.shape[-1], timestep=timestep
                 ).sample
 
-            # repaint / extend branch: after n_min, do masked ODE-like update and blend
-            if (task == "repaint" or is_extend) and i >= n_min:
+            # ----- ORIGINAL BEHAVIOR: initialize from source/noise at i == n_min -----
+            if is_repaint_mode and i == n_min:
+                t_i = t / 1000
+                if z0 is None:
+                    z0 = target_latents  # safety; normally set earlier
+                zt_src = (1 - t_i) * x0 + (t_i) * z0
+                target_latents = zt_src  # start editable trajectory from zt_src
+
+            # ----- Repaint/Extend masked ODE (repo uses hard mask via torch.where) -----
+            if is_repaint_mode and i >= n_min:
                 t_i = t / 1000
                 t_im1 = (timesteps[i + 1] / 1000) if (i + 1 < len(timesteps)) else torch.zeros_like(t_i).to(self.device)
 
                 target_latents = target_latents.to(torch.float32)
                 prev = target_latents + (t_im1 - t_i) * noise
                 prev = prev.to(self.dtype)
-                target_latents = prev
 
-                # "source" latent trajectory at next step
-                if z0 is None:
-                    z0 = target_latents  # safety
                 zt_src = (1 - t_im1) * x0 + (t_im1) * z0
-                # soft blend: 1 in repaint tail, 0 in preserved region
-                target_latents = repaint_mask * target_latents + (1.0 - repaint_mask) * zt_src
+
+                # EXACT upstream behavior: binary mask decides editable vs source trajectory
+                target_latents = torch.where(repaint_mask == 1.0, prev, zt_src)
+
             else:
-                # normal diffusion step
+                # Normal diffusion when not in repaint/extend mode
                 target_latents = scheduler.step(
                     model_output=noise, timestep=t, sample=target_latents,
                     return_dict=False, omega=omega_scale,
