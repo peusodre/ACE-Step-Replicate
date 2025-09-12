@@ -48,8 +48,7 @@ build:
     - "cutlet"
     - "fugashi[unidic-lite]"
     # Training utilities (optional but may be needed)
-    # Web interface (may be needed for some components)
-    - "gradio==4.44.0"
+    # Note: gradio removed as it's not used and causes pydantic conflicts
 
   # Install PyTorch and dependencies with optimizations
   run:
