@@ -48,100 +48,12 @@ from acestep.apg_guidance import (
 )
 import torchaudio
 from .cpu_offload import cpu_offload
-from dataclasses import dataclass
-from typing import Optional
-
-
-@dataclass
-class DebugCfg:
-    enabled: bool = False          # master switch
-    step_every: int = 10           # how often to log during diffusion
-    dump_specs: bool = False       # save mel/spec PNGs after decode
-    dump_latents_npz: bool = False # save .npz of key latents
-    dump_audio_wav: bool = False   # save extra debug wavs (pre/post)
-    run_tag: str = ""              # optional tag to identify logs
-
-def _rms(x, eps=1e-12):
-    return torch.sqrt(torch.clamp((x.float()**2).mean(), eps))
-
-def _rms_t(x, eps=1e-12):
-    # RMS over time axis only (last dim), then mean over batch/channels
-    return float(torch.sqrt(torch.clamp((x.float()**2).mean(dim=-1), eps)).mean().detach().cpu())
-
-def _db(v, floor=-80.0):
-    v = float(v)
-    if v <= 0: return floor
-    return max(floor, 20.0 * math.log10(v))
-
-def _tstats(name, x):
-    if x is None: 
-        logger.info(f"[DBG] {name}: None")
-        return
-    x32 = x.detach().float()
-    if x32.numel() <= 1:
-        v = float(x32.view(-1)[0].cpu())
-        logger.info(f"[DBG] {name}: scalar={v:.5f}")
-        return
-    mn = float(x32.min().cpu())
-    mx = float(x32.max().cpu())
-    me = float(x32.mean().cpu())
-    sd = float(x32.std(unbiased=False).cpu())
-    rm = float(_rms(x32))
-    logger.info(f"[DBG] {name}: shape={tuple(x.shape)} dtype={x.dtype} "
-                f"min={mn:.5f} max={mx:.5f} mean={me:.5f} std={sd:.5f} rms={rm:.5f} ({_db(rm):.2f} dB)")
-
-def _center_diff(a, b):
-    if a is None or b is None: return None
-    d = (a - b).abs().amax().item()
-    return d
-
-def _mel_spectrogram_png(wav, sr, outfile):
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        import torchaudio
-        mel = torchaudio.transforms.MelSpectrogram(
-            sample_rate=sr, n_fft=2048, hop_length=512, n_mels=128
-        )(wav.cpu())
-        mel_db = 10.0 * torch.log10(mel.clamp_min(1e-8))
-        plt.figure(figsize=(10, 3))
-        plt.imshow(mel_db.squeeze(0).numpy(), aspect='auto', origin='lower')
-        plt.colorbar()
-        plt.title(os.path.basename(outfile))
-        plt.tight_layout()
-        plt.savefig(outfile)
-        plt.close()
-        logger.info(f"[DBG] wrote {outfile}")
-    except Exception as e:
-        logger.warning(f"[DBG] mel save failed: {e}")
-
-class _Tick:
-    def __init__(self, name): 
-        self.name = name
-        self.t = time.time()
-    def done(self, note=""): 
-        dt = time.time() - self.t
-        logger.info(f"[TIME] {self.name}: {dt:.3f}s {note}")
-
-def _nan_guard(tag, x):
-    if x is None: 
-        return
-    bad = torch.isnan(x).any() or torch.isinf(x).any()
-    if bad: 
-        logger.warning(f"[NAN] {tag} has NaN/Inf!")
-
-def _clamp_span(l_min, l_max, L):
-    l_min = max(0, min(l_min, L-1))
-    l_max = max(l_min+1, min(l_max, L))
-    return l_min, l_max
 
 
 torch.backends.cudnn.benchmark = False
 torch.set_float32_matmul_precision("high")
 torch.backends.cudnn.deterministic = True
-if torch.cuda.is_available():
-    torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cuda.matmul.allow_tf32 = True
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
@@ -270,7 +182,6 @@ class ACEStepPipeline:
         self.cpu_offload = cpu_offload
         self.quantized = quantized
         self.overlapped_decode = overlapped_decode
-        self.debug = DebugCfg(enabled=False)  # flip this on when you want deep logs
 
     def cleanup_memory(self):
         """Clean up GPU and CPU memory to prevent VRAM overflow during multiple generations."""
@@ -331,7 +242,7 @@ class ACEStepPipeline:
             self.ace_step_transformer = (
                 self.ace_step_transformer.to(self.device).eval().to(self.dtype)
             )
-        if self.torch_compile and self.device.type == "cuda" and not self.quantized:
+        if self.torch_compile:
             self.ace_step_transformer = torch.compile(self.ace_step_transformer)
 
         self.music_dcae = MusicDCAE(
@@ -343,7 +254,7 @@ class ACEStepPipeline:
             self.music_dcae = self.music_dcae.to("cpu").eval().to(self.dtype)
         else:
             self.music_dcae = self.music_dcae.to(self.device).eval().to(self.dtype)
-        if self.torch_compile and self.device.type == "cuda" and not self.quantized:
+        if self.torch_compile:
             self.music_dcae = torch.compile(self.music_dcae)
 
         lang_segment = LangSegment()
@@ -361,7 +272,7 @@ class ACEStepPipeline:
             text_encoder_model = text_encoder_model.to(self.device).eval().to(self.dtype)
         text_encoder_model.requires_grad_(False)
         self.text_encoder_model = text_encoder_model
-        if self.torch_compile and self.device.type == "cuda" and not self.quantized:
+        if self.torch_compile:
             self.text_encoder_model = torch.compile(self.text_encoder_model)
 
         self.text_tokenizer = AutoTokenizer.from_pretrained(
@@ -417,36 +328,34 @@ class ACEStepPipeline:
         ace_step_checkpoint_path = os.path.join(checkpoint_dir, "ace_step_transformer")
         text_encoder_checkpoint_path = os.path.join(checkpoint_dir, "umt5-base")
 
-        target = "cpu" if self.cpu_offload else self.device
-        
         self.music_dcae = MusicDCAE(
             dcae_checkpoint_path=dcae_checkpoint_path,
             vocoder_checkpoint_path=vocoder_checkpoint_path,
         )
-        self.music_dcae.eval().to(self.dtype).to(target)
-        if self.torch_compile and self.device.type == "cuda" and not self.quantized:
-            self.music_dcae = torch.compile(self.music_dcae)
+        if self.cpu_offload:
+            self.music_dcae.eval().to(self.dtype).to(self.device)
+        else:
+            self.music_dcae.eval().to(self.dtype).to('cpu')
+        self.music_dcae = torch.compile(self.music_dcae)
 
         self.ace_step_transformer = ACEStepTransformer2DModel.from_pretrained(ace_step_checkpoint_path)
-        self.ace_step_transformer.eval().to(self.dtype).to(target)
-        if self.torch_compile and self.device.type == "cuda" and not self.quantized:
-            self.ace_step_transformer = torch.compile(self.ace_step_transformer)
+        self.ace_step_transformer.eval().to(self.dtype).to('cpu')
+        self.ace_step_transformer = torch.compile(self.ace_step_transformer)
         self.ace_step_transformer.load_state_dict(
             torch.load(
                 os.path.join(ace_step_checkpoint_path, "diffusion_pytorch_model_int4wo.bin"),
-                map_location=target,
+                map_location=self.device,
             ),assign=True
         )
         self.ace_step_transformer.torchao_quantized = True
 
         self.text_encoder_model = UMT5EncoderModel.from_pretrained(text_encoder_checkpoint_path)
-        self.text_encoder_model.eval().to(self.dtype).to(target)
-        if self.torch_compile and self.device.type == "cuda" and not self.quantized:
-            self.text_encoder_model = torch.compile(self.text_encoder_model)
+        self.text_encoder_model.eval().to(self.dtype).to('cpu')
+        self.text_encoder_model = torch.compile(self.text_encoder_model)
         self.text_encoder_model.load_state_dict(
             torch.load(
                 os.path.join(text_encoder_checkpoint_path, "pytorch_model_int4wo.bin"),
-                map_location=target,
+                map_location=self.device,
             ), assign=True
         )
         self.text_encoder_model.torchao_quantized = True
@@ -502,9 +411,7 @@ class ACEStepPipeline:
                 output[:] *= tau
                 return output
 
-            L = len(self.text_encoder_model.encoder.block)
-            lm, lx = _clamp_span(l_min, l_max, L)
-            for i in range(lm, lx):
+            for i in range(l_min, l_max):
                 handler = (
                     self.text_encoder_model.encoder.block[i]
                     .layer[0]
@@ -740,7 +647,7 @@ class ACEStepPipeline:
 
         T_steps = infer_steps
         frame_length = src_latents.shape[-1]
-        attention_mask = torch.ones(bsz, frame_length, device=self.device, dtype=torch.bool)
+        attention_mask = torch.ones(bsz, frame_length, device=self.device, dtype=self.dtype)
 
         timesteps, T_steps = retrieve_timesteps(
             scheduler, T_steps, self.device, timesteps=None
@@ -798,8 +705,7 @@ class ACEStepPipeline:
 
         logger.info("flowedit start from {} to {}".format(n_min, n_max))
 
-        use_bar = bool(self.debug.enabled)
-        for i, t in tqdm(enumerate(timesteps), total=T_steps, disable=not use_bar):
+        for i, t in tqdm(enumerate(timesteps), total=T_steps):
 
             if i < n_min:
                 continue
@@ -937,19 +843,15 @@ class ACEStepPipeline:
                 sigma_max=sigma_max
             )
 
-        infer_steps = max(1, int(round(sigma_max * infer_steps)))
+        infer_steps = int(sigma_max * infer_steps)
         timesteps, num_inference_steps = retrieve_timesteps(
             scheduler,
             num_inference_steps=infer_steps,
             device=self.device,
             timesteps=None,
         )
-        logger.info(f"[SCHED] steps={num_inference_steps} t=[{float(timesteps[0])/1000:.4f}…{float(timesteps[-1])/1000:.4f}]")
         noisy_image = gt_latents * (1 - scheduler.sigma_max) + noise * scheduler.sigma_max
-        first = float(timesteps[0]/1000)
-        last = float(timesteps[-1]/1000)
-        logger.info(f"{scheduler.sigma_min=} {scheduler.sigma_max=} steps={num_inference_steps} "
-                    f"t=[{first:.4f}…{last:.4f}]")
+        logger.info(f"{scheduler.sigma_min=} {scheduler.sigma_max=} {timesteps=} {num_inference_steps=}")
         return noisy_image, timesteps, scheduler, num_inference_steps
 
     @cpu_offload("ace_step_transformer")
@@ -1001,19 +903,19 @@ class ACEStepPipeline:
         extend_tile_then_repaint: bool = False,
         # ---- extend bootstrap tuning (new) ----
         extend_bootstrap_edge_sec: float = 2.0,          # how many seconds of edge context to tile from
-        extend_bootstrap_sigma_max: Optional[float] = None, # override the sigma_max used inside bootstrap; None -> derive from extend_bootstrap_strength
+        extend_bootstrap_sigma_max: float | None = None, # override the sigma_max used inside bootstrap; None -> derive from extend_bootstrap_strength
         extend_bootstrap_noise_mode: str = "zeros",      # "zeros" | "matched" | "gauss"
     ):
         
         # Mutual exclusion guards
-        if extend_tile_only:
-            extend_bootstrap = False
+        if extend_tile_only and extend_edge_bootstrap_only:
+            logger.warning("Both tile_only and edge_bootstrap_only set; preferring tile_only.")
             extend_edge_bootstrap_only = False
-
-        if self.debug.enabled:
-            logger.info(f"[PATH] enter text2music_diffusion_process "
-                        f"is_extend={(src_latents is not None and (repaint_start<0 or repaint_end> (src_latents.shape[-1]/_frames_per_second(44100))))} "
-                        f"add_retake_noise={add_retake_noise}")
+        if extend_tile_only and extend_bootstrap:
+            logger.info("tile_only=True → forcing extend_bootstrap=False for purity.")
+            extend_bootstrap = False
+        if extend_tile_only and extend_edge_bootstrap_only: 
+            extend_edge_bootstrap_only = False  # keep exclusivity
 
         logger.info(
             "cfg_type: {}, guidance_scale: {}, omega_scale: {}".format(
@@ -1021,6 +923,10 @@ class ACEStepPipeline:
             )
         )
         
+        # Make the two "only" modes mutually exclusive
+        if extend_tile_only and extend_edge_bootstrap_only:
+            logger.warning("Both extend_tile_only and extend_edge_bootstrap_only were set; defaulting to extend_edge_bootstrap_only.")
+            extend_tile_only = False
         do_classifier_free_guidance = True
         if guidance_scale == 0.0 or guidance_scale == 1.0:
             do_classifier_free_guidance = False
@@ -1059,21 +965,16 @@ class ACEStepPipeline:
                 shift=3.0,
             )
 
-        if self.debug.enabled:
-            logger.info(f"[PATH] scheduler={scheduler_type}")
-
         # Use the correct sample rate for frame calculations
         # If we have source latents, use 44.1kHz (MusicDCAE's native rate)
         # Otherwise use the user-provided sample_rate
         if src_latents is not None:
             # Use MusicDCAE's native sample rate (44.1kHz) for frame calculations
             fps = _frames_per_second(44100)
-            logger.info(f"[AUDIO] latent_fps={fps:.6f} (44.1k-native), decode_sample_rate={sample_rate}")
-            if sample_rate != 44100:
-                logger.warning("[AUDIO] Decoding at non-native SR; resampling occurs downstream.")
+            logger.info(f"Using 44.1kHz for frame calculations (MusicDCAE native rate): fps={fps:.6f}")
         else:
             fps = _frames_per_second(sample_rate)
-            logger.info(f"[AUDIO] fps={fps:.6f} (decode_sample_rate={sample_rate})")
+            logger.info(f"Using {sample_rate}Hz for frame calculations: fps={fps:.6f}")
             
         frame_length = int(duration * fps)
         if src_latents is not None:
@@ -1104,8 +1005,9 @@ class ACEStepPipeline:
                 device=self.device,
                 sigmas=sigmas,
             )
-            logger.info(f"oss_steps={oss_steps} steps={num_inference_steps} "
-                        f"t=[{float(timesteps[0])/1000:.4f}…{float(timesteps[-1])/1000:.4f}]")
+            logger.info(
+                f"oss_steps: {oss_steps}, num_inference_steps: {num_inference_steps} after remapping to timesteps {timesteps}"
+            )
         else:
             timesteps, num_inference_steps = retrieve_timesteps(
                 scheduler,
@@ -1120,7 +1022,6 @@ class ACEStepPipeline:
             device=self.device,
             dtype=self.dtype,
         )
-        _nan_guard("target_latents@init", target_latents)
 
         is_repaint = False
         is_extend = False
@@ -1147,13 +1048,10 @@ class ACEStepPipeline:
                 return None
 
             # Override n_min to ensure low sigma repaint
-            TARGET_SIGMA = 0.20
-            late = _choose_n_min_by_sigma(TARGET_SIGMA)
-            if late is not None:
-                late = min(late, num_inference_steps - 2)
-                if late > n_min:
-                    logger.info(f"[REPAINT-PLAN] target_sigma<= {TARGET_SIGMA:.2f} → n_min {n_min} -> {late}")
-                    n_min = late
+            late = _choose_n_min_by_sigma(0.20)
+            if late is not None and late > n_min:
+                logger.info(f"[DBG] overriding n_min {n_min} -> {late} to ensure low sigma repaint")
+                n_min = late
             
             # Angle (tensor) used for mixing latents
             retake_variance = (
@@ -1206,10 +1104,6 @@ class ACEStepPipeline:
             if is_extend:
                 is_repaint = True
 
-            if self.debug.enabled:
-                logger.info(f"[PATH] repaint? {is_repaint}  extend? {is_extend} "
-                            f"frames(start={repaint_start_frame}, end={repaint_end_frame}, src_len={src_len if src_latents is not None else None})")
-
             # TODO: train a mask aware repainting controlnet
             # to make sure mean = 0, std = 1
             if not is_repaint:
@@ -1233,9 +1127,6 @@ class ACEStepPipeline:
                 zt_edit = x0.clone()
                 z0 = repaint_noise
             elif is_extend:
-                logger.info("[PATH] TILE-ONLY branch entered")
-                _tstats("x0(orig)", src_latents)
-                
                 gt_latents = src_latents
                 src_len = gt_latents.shape[-1]
                 max_infer_fame_length = int(240 * fps)
@@ -1244,6 +1135,7 @@ class ACEStepPipeline:
                 # Ignore negative repaint_start for extension; do not pad the left at all.
                 # Compute desired extension purely from repaint_end.
                 desired_end_f = max(src_len, repaint_end_frame)  # never earlier than src end
+                left_pad  = 0
                 right_pad = max(0, desired_end_f - src_len)
                 new_len   = src_len + right_pad
 
@@ -1283,7 +1175,7 @@ class ACEStepPipeline:
                     reps = (need + edge_chunk.shape[-1] - 1) // edge_chunk.shape[-1]
                     return edge_chunk.repeat(1,1,1,reps)[..., :need]
 
-                EDGE = max(64, int(round(float(extend_bootstrap_edge_sec) * fps)))
+                EDGE = max(64, int(round(float(extend_bootstrap_edge_sec if 'extend_bootstrap_edge_sec' in locals() else 2.0) * fps)))
                 mid  = x0[..., :src_len]  # original clip unchanged
 
                 right_seed = None
@@ -1310,21 +1202,12 @@ class ACEStepPipeline:
                     parts.append(right_seed)
                 z0 = torch.cat(parts, dim=-1)
 
-                _tstats("tiled(before stats match)", z0)
-
                 # RMS + global distribution match keeps vocoder stable
                 z0 = self._match_rms_like(z0, x0)
                 z0 = self._match_global_stats(z0, x0)
 
-                _tstats("tiled(after stats match)", z0)
-
                 target_latents = z0.clone()
                 zt_edit = x0.clone()
-
-                _tstats("x0(padded/ref)", x0)
-                _tstats("z0(seed)", z0)
-                _tstats("repaint_mask mean", repaint_mask.mean())
-                logger.info(f"[MASK] repaint coverage: {(repaint_mask>0).float().mean().item():.2%}  ramp_sec={seam_seconds}")
 
                 # soften the repaint mask at seam (on the right only)
                 ramp_len = int(max(1, round(float(seam_seconds) * fps)))
@@ -1337,26 +1220,6 @@ class ACEStepPipeline:
                 is_repaint = True
                 is_extend  = True
                 logger.info(f"[TILE→REPAINT-R] right-only seed (EDGE={EDGE}) → repaint tail; left kept intact.")
-                
-                # Seam check before repaint starts
-                if is_extend and right_pad > 0:
-                    seam_L = min(int(round(seam_seconds*fps)), right_pad, 1024)
-                    left_edge  = x0[..., src_len-seam_L:src_len]
-                    right_edge = z0[..., src_len:src_len+seam_L]
-                    diff = (left_edge - right_edge).abs().amax().item()
-                    logger.info(f"[SEAM] max_abs_diff={diff:.6f} over {seam_L}f")
-                
-                # Optional latents snapshots
-                if hasattr(self, "debug") and self.debug.enabled and self.debug.dump_latents_npz:
-                    npz_name = f"dbg_latents_{self.debug.run_tag}_prepaint.npz"
-                    try:
-                        import numpy as np
-                        np.savez_compressed(npz_name, x0=x0.detach().cpu().numpy(),
-                                            z0=z0.detach().cpu().numpy(),
-                                            mask=repaint_mask.detach().cpu().numpy())
-                        logger.info(f"[DBG] wrote {npz_name}")
-                    except Exception as e:
-                        logger.warning(f"[DBG] latents npz failed: {e}")
 
         if audio2audio_enable and ref_latents is not None:
             logger.info(
@@ -1370,7 +1233,7 @@ class ACEStepPipeline:
                 infer_steps=infer_steps,
             )
 
-        attention_mask = torch.ones(bsz, frame_length, device=self.device, dtype=torch.bool)
+        attention_mask = torch.ones(bsz, frame_length, device=self.device, dtype=self.dtype)
 
         # guidance interval
         start_idx = int(num_inference_steps * ((1 - guidance_interval) / 2))
@@ -1398,9 +1261,7 @@ class ACEStepPipeline:
                 output[:] *= tau
                 return output
 
-            L = len(self.ace_step_transformer.lyric_encoder.encoders)
-            lm, lx = _clamp_span(l_min, l_max, L)
-            for i in range(lm, lx):
+            for i in range(l_min, l_max):
                 handler = self.ace_step_transformer.lyric_encoder.encoders[
                     i
                 ].self_attn.linear_q.register_forward_hook(hook)
@@ -1483,9 +1344,7 @@ class ACEStepPipeline:
                 output[:] *= tau
                 return output
 
-            L = len(self.ace_step_transformer.transformer_blocks)
-            lm, lx = _clamp_span(l_min, l_max, L)
-            for i in range(lm, lx):
+            for i in range(l_min, l_max):
                 handler = self.ace_step_transformer.transformer_blocks[
                     i
                 ].attn.to_q.register_forward_hook(hook)
@@ -1522,33 +1381,17 @@ class ACEStepPipeline:
             logger.info(f"[DBG] shape guard enforced: target_latents={tuple(target_latents.shape)} z0={tuple(z0.shape)} x0={tuple(x0.shape)} need={need}")
 
         # Ensure repaint actually starts inside the schedule and at low noise
-        if add_retake_noise:
-            n_min = self._safe_cap("n_min", n_min, 1, num_inference_steps - 2)
+        n_min = self._safe_cap("n_min", n_min, 1, num_inference_steps - 2)
 
-            # Log sigma around n_min
-            try:
-                scheduler._init_step_index(timesteps[n_min])
-                sig_here = float(scheduler.sigmas[scheduler.step_index].detach().cpu())
-            except Exception:
-                sig_here = float(timesteps[n_min] / 1000)
-            logger.info(f"[REPAINT] n_min={n_min}/{num_inference_steps}  est_sigma={sig_here:.4f}  start_idx={start_idx} end_idx={end_idx}")
-            logger.info(f"[PATH] repaint n_min={n_min} of {num_inference_steps} "
-                        f"(retake_variance={'tensor' if isinstance(retake_variance, torch.Tensor) else float(retake_variance)})")
+        # Log sigma around n_min
+        try:
+            scheduler._init_step_index(timesteps[n_min])
+            sig_here = float(scheduler.sigmas[scheduler.step_index].detach().cpu())
+        except Exception:
+            sig_here = float(timesteps[n_min] / 1000)
+        logger.info(f"[REPAINT] n_min={n_min}/{num_inference_steps}  est_sigma={sig_here:.4f}  start_idx={start_idx} end_idx={end_idx}")
 
-        use_bar = bool(self.debug.enabled)
-        for i, t in tqdm(enumerate(timesteps), total=num_inference_steps, disable=not use_bar):
-            if self.debug.enabled and (i % max(1, self.debug.step_every) == 0):
-                # short pulse logs
-                logger.info(f"[STEP] i={i}/{num_inference_steps} t={float(t)/1000:.4f} "
-                            f"in_guidance={start_idx<=i<end_idx} repaint={is_repaint and i>=n_min}")
-                
-                # Scheduler sigma probe
-                try:
-                    scheduler._init_step_index(t)
-                    sig = float(scheduler.sigmas[scheduler.step_index])
-                    logger.info(f"[SIG] i={i} sigma={sig:.5f}")
-                except Exception:
-                    pass
+        for i, t in tqdm(enumerate(timesteps), total=num_inference_steps):
 
             if add_retake_noise and (src_latents is not None) and is_repaint:
                 if i < n_min:
@@ -1564,12 +1407,8 @@ class ACEStepPipeline:
                         scheduler._init_step_index(t)
                         sigma_here = float(scheduler.sigmas[scheduler.step_index].detach().cpu())
                     except Exception:
-                        sigma_here = float(t / 1000)
-                    logger.info(f"[REPAINT-START] n_min={n_min}/{num_inference_steps} sigma≈{sigma_here:.4f}")
-                    
-                    # Key step stats
-                    if i in {n_min, n_min+1, end_idx-1, end_idx}:
-                        _tstats("latents@step", target_latents)
+                        sigma_here = float(t_i)
+                    logger.info(f"[DBG] repaint n_min={n_min}/{num_inference_steps}  sigma≈{sigma_here:.4f}  retake_frac={float(retake_variance) if isinstance(retake_variance, torch.Tensor)==False else 'tensor'}")
 
             # expand the latents if we are doing classifier free guidance
             latents = target_latents
@@ -1579,8 +1418,9 @@ class ACEStepPipeline:
                 # compute current guidance scale
                 if guidance_interval_decay > 0:
                     # Linearly interpolate to calculate the current guidance scale
-                    den = max(1, (end_idx - start_idx - 1))
-                    progress = (i - start_idx) / den  # 归一化到[0,1]
+                    progress = (i - start_idx) / (
+                        end_idx - start_idx - 1
+                    )  # 归一化到[0,1]
                     current_guidance_scale = (
                         guidance_scale
                         - (guidance_scale - min_guidance_scale)
@@ -1673,9 +1513,6 @@ class ACEStepPipeline:
                         zero_steps=zero_steps,
                         use_zero_init=use_zero_init,
                     )
-                
-                # NaN guard for noise prediction
-                _nan_guard("noise_pred", noise_pred)
             else:
                 latent_model_input = latents
                 timestep = t.expand(latent_model_input.shape[0])
@@ -1687,9 +1524,6 @@ class ACEStepPipeline:
                     output_length=latent_model_input.shape[-1],
                     timestep=timestep,
                 ).sample
-                
-                # NaN guard for noise prediction
-                _nan_guard("noise_pred", noise_pred)
 
             if is_repaint and i >= n_min:
                 t_i = t / 1000
@@ -1711,21 +1545,16 @@ class ACEStepPipeline:
                 
                 if i in (n_min, n_min+1, end_idx-1, end_idx):
                     logger.info(f"[DBG] step={i}  t={float(t)/1000:.4f}  in_guidance={start_idx <= i < end_idx}  rms(prev)={_rms_t(prev_sample):.6f}")
-                
-                if is_repaint and i >= n_min and (i % max(1, self.debug.step_every) == 0):
-                    _tstats("prev_sample", prev_sample)
-                
                 # Soft blend (mask is 1.0 deep in pad, tapers to 0.0 at the seam)
                 target_latents = repaint_mask * target_latents + (1.0 - repaint_mask) * zt_src
             else:
-                generator = (random_generators[0] if random_generators else None)
                 target_latents = scheduler.step(
                     model_output=noise_pred,
                     timestep=t,
                     sample=target_latents,
                     return_dict=False,
                     omega=omega_scale,
-                    generator=generator,
+                    generator=random_generators[0],
                 )[0]
 
         # Note: Re-append code removed - we already trimmed by reducing left_pad/right_pad
@@ -1752,36 +1581,7 @@ class ACEStepPipeline:
             else:
                 _, pred_wavs = self.music_dcae.decode(pred_latents, sr=sample_rate)
         pred_wavs = [pred_wav.cpu().float() for pred_wav in pred_wavs]
-        
-        # Audio insights after decode
-        if hasattr(self, "debug") and self.debug.enabled:
-            for bi, w in enumerate(pred_wavs):
-                r = _rms(w)
-                pk = float(w.abs().max())
-                cf = (pk / (r + 1e-12)) if r > 0 else float("inf")  # crest factor
-                dc = float(w.mean())
-                logger.info(f"[AUDIO] batch={bi} rms={float(r):.6f} ({_db(r):.2f} dBFS) "
-                            f"peak={pk:.6f} ({_db(pk):.2f} dBFS) crest={cf:.2f} dc={dc:.6f}")
-
-                # Spectral stats
-                try:
-                    spec = torch.stft(w, n_fft=2048, hop_length=512, return_complex=True).abs()  # (F,T)
-                    freqs = torch.linspace(0, sample_rate/2, spec.size(0), device=spec.device)
-                    p = spec + 1e-12
-                    centroid = (p * freqs[:,None]).sum(dim=0) / p.sum(dim=0)                       # per frame
-                    rolloff_idx = (p.cumsum(dim=0) / p.sum(dim=0)).ge(0.85).float().argmax(dim=0)  # 85% rolloff
-                    rolloff = freqs[rolloff_idx].float().mean().item()
-                    logger.info(f"[AUDIO] centroid_mean={centroid.mean().item():.1f}Hz "
-                                f"rolloff85={rolloff:.1f}Hz")
-                except Exception as e:
-                    logger.warning(f"[AUDIO] spectral stats failed: {e}")
-
-                if self.debug.dump_specs:
-                    png = f"dbg_spec_{self.debug.run_tag}_b{bi}_sr{sample_rate}.png"
-                    _mel_spectrogram_png(w.unsqueeze(0), sample_rate, png)
-        
-        use_bar = bool(self.debug.enabled)
-        for i in tqdm(range(bs), disable=not use_bar):
+        for i in tqdm(range(bs)):
             output_audio_path = self.save_wav_file(
                 pred_wavs[i],
                 i,
@@ -1813,10 +1613,10 @@ class ACEStepPipeline:
                 output_path_wav = save_path
 
         target_wav = target_wav.float()
-        backend = "sox_io" if format.lower() == "ogg" else "soundfile"
-        logger.info(f"Saving audio to {output_path_wav} using backend {backend} (format={format})")
-        if format.lower() == "ogg":
-            logger.info(f"[AUDIO] Using sox_io backend for OGG format")
+        backend = "soundfile"
+        if format == "ogg":
+            backend = "sox"
+        logger.info(f"Saving audio to {output_path_wav} using backend {backend}")
         torchaudio.save(
             output_path_wav, target_wav, sample_rate=sample_rate, format=format, backend=backend
         )
@@ -1902,21 +1702,12 @@ class ACEStepPipeline:
         extend_tile_then_repaint: bool = False,
         # ---- extend bootstrap tuning (new) ----
         extend_bootstrap_edge_sec: float = 2.0,
-        extend_bootstrap_sigma_max: Optional[float] = None,
+        extend_bootstrap_sigma_max: float | None = None,
         extend_bootstrap_noise_mode: str = "zeros",
     ):
 
         start_time = time.time()
 
-        # Debug initialization
-        if debug:
-            # `debug` is your existing call arg; keep it to toggle
-            self.debug.enabled = True
-            self.debug.run_tag = f"{int(time.time())}"
-            logger.info(f"[DBG] debug enabled tag={self.debug.run_tag}")
-
-        if self.debug.enabled:
-            logger.info(f"[PATH] task={task} a2a={audio2audio_enable} extend_tile_only={extend_tile_only}")
 
         # Sanity log to see effective task
         logger.info(f"EFFECTIVE TASK: {task}  (a2a_enable={audio2audio_enable}, ref_audio_input={'yes' if ref_audio_input else 'no'})")
@@ -1927,11 +1718,6 @@ class ACEStepPipeline:
                 self.load_quantized_checkpoint(self.checkpoint_dir)
             else:
                 self.load_checkpoint(self.checkpoint_dir)
-            
-            # Environment logging
-            cuda_ver = getattr(torch.version, "cuda", None)
-            logger.info(f"[ENV] device={self.device} dtype={self.dtype} torch={torch.__version__} "
-                        f"cuda={cuda_ver} mps={'yes' if torch.backends.mps.is_available() else 'no'}")
 
         self.load_lora(lora_name_or_path, lora_weight)
         load_model_cost = time.time() - start_time
@@ -1949,28 +1735,14 @@ class ACEStepPipeline:
         else:
             oss_steps = []
 
-        # Validate required prompts
-        if task != "edit" and not prompt:
-            raise ValueError("`prompt` is required for task='text2music' / 'retake' / 'repaint' / 'extend'")
-        if task == "edit" and not edit_target_prompt:
-            raise ValueError("`edit_target_prompt` is required for task='edit'")
-        
-        # Handle None prompt to prevent tokenizer crash
-        if prompt is None:
-            prompt = ""
         texts = [prompt]
-        t = _Tick("encode_text")
         encoder_text_hidden_states, text_attention_mask = self.get_text_embeddings(texts)
-        _nan_guard("encoder_text_hidden_states", encoder_text_hidden_states)
-        t.done()
         encoder_text_hidden_states = encoder_text_hidden_states.repeat(batch_size, 1, 1)
         text_attention_mask = text_attention_mask.repeat(batch_size, 1)
 
         encoder_text_hidden_states_null = None
         if use_erg_tag:
-            t = _Tick("encode_text_null")
             encoder_text_hidden_states_null = self.get_text_embeddings_null(texts)
-            t.done()
             encoder_text_hidden_states_null = encoder_text_hidden_states_null.repeat(batch_size, 1, 1)
 
         # not support for released checkpoint
@@ -1979,7 +1751,7 @@ class ACEStepPipeline:
         # 6 lyric
         lyric_token_idx = torch.tensor([0]).repeat(batch_size, 1).to(self.device).long()
         lyric_mask = torch.tensor([0]).repeat(batch_size, 1).to(self.device).long()
-        if lyrics:
+        if len(lyrics) > 0:
             lyric_token_idx = self.tokenize_lyrics(lyrics, debug=debug)
             lyric_mask = [1] * len(lyric_token_idx)
             lyric_token_idx = (
@@ -2045,7 +1817,7 @@ class ACEStepPipeline:
             target_lyric_mask = (
                 torch.tensor([0]).repeat(batch_size, 1).to(self.device).long()
             )
-            if edit_target_lyrics:
+            if len(edit_target_lyrics) > 0:
                 target_lyric_token_idx = self.tokenize_lyrics(
                     edit_target_lyrics, debug=True
                 )
@@ -2086,7 +1858,6 @@ class ACEStepPipeline:
                 scheduler_type=scheduler_type,
             )
         else:
-            t = _Tick("text2music_diffusion")
             target_latents = self.text2music_diffusion_process(
                 duration=audio_duration,
                 encoder_text_hidden_states=encoder_text_hidden_states,
@@ -2132,13 +1903,11 @@ class ACEStepPipeline:
                 extend_bootstrap_sigma_max=extend_bootstrap_sigma_max,
                 extend_bootstrap_noise_mode=extend_bootstrap_noise_mode,
             )
-            t.done()
 
         end_time = time.time()
         diffusion_time_cost = end_time - start_time
         start_time = end_time
 
-        t = _Tick("latents2audio")
         output_paths = self.latents2audio(
             latents=target_latents,
             target_wav_duration_second=audio_duration,  # use the value passed in
@@ -2146,7 +1915,6 @@ class ACEStepPipeline:
             format=format,
             sample_rate=sample_rate,
         )
-        t.done()
 
         # Clean up memory after generation
         self.cleanup_memory()
@@ -2205,11 +1973,5 @@ class ACEStepPipeline:
             input_params_json["audio_path"] = output_audio_path
             with open(input_params_json_save_path, "w", encoding="utf-8") as f:
                 json.dump(input_params_json, f, indent=4, ensure_ascii=False)
-            logger.info(f"[OUT] wrote params JSON: {input_params_json_save_path}")
-
-        # Log final outputs
-        for i, output_audio_path in enumerate(output_paths):
-            input_params_json_save_path = output_audio_path.replace(f".{format}", "_input_params.json")
-            logger.info(f"[OUT] audio[{i}]: {output_audio_path} | params: {input_params_json_save_path}")
 
         return output_paths + [input_params_json]
