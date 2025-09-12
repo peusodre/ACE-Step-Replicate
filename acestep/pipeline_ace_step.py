@@ -452,59 +452,64 @@ class ACEStepPipeline:
         is_extend = False
 
         if task == "repaint":
-            s_f = min(Tsrc, sec_to_frames(repaint_start_sec, fps_out))
-            e_f = min(Tsrc, sec_to_frames(repaint_end_sec,   fps_out))
+            # --- match original frame math (fixed 44.1k) ---
+            def _sec_to_frames_ace441(s: float) -> int:
+                return int(s * 44100 / 512 / 8)
+
+            s_f = _sec_to_frames_ace441(repaint_start_sec)
+            e_f = _sec_to_frames_ace441(repaint_end_sec)
+
+            # clamp to [0, Tsrc] to avoid OOB
+            s_f = max(0, min(Tsrc, s_f))
+            e_f = max(0, min(Tsrc, e_f))
             if e_f <= s_f:
                 raise ValueError("repaint_end must be > repaint_start")
 
+            # binary repaint mask exactly like original
+            repaint_mask = torch.zeros_like(x0)
             repaint_mask[..., s_f:e_f] = 1.0
 
-            # retake_variance α∈[0,1] controls deviation from source:
-            # seed = (1-α)*x0 + α*noise_mix  inside the repaint window
+            # --- retake noise: rotate between two noises; DO NOT anchor to x0 here ---
             alpha = float(retake_variance)
-            base_seed = x0.clone()  # source latents
-            noise_a = target_latents  # current random init
-            noise_b = randn_tensor(
+            # angle = α * π/2
+            angle = torch.tensor(alpha * math.pi / 2, device=self.device, dtype=self.dtype)
+
+            # ε1 = your current random init (target_latents), ε2 = new random noise
+            retake_latents = randn_tensor(
                 shape=target_latents.shape,
                 generator=retake_random_generators,
                 device=self.device,
                 dtype=self.dtype,
             )
-            angle = torch.tensor(alpha * math.pi / 2, device=self.device, dtype=self.dtype)
-            noise_mix = torch.cos(angle) * noise_a + torch.sin(angle) * noise_b
-            seed_mix = (1.0 - alpha) * base_seed + alpha * noise_mix
-            z0 = torch.where(repaint_mask == 1.0, seed_mix, x0)
+            repaint_noise = torch.cos(angle) * target_latents + torch.sin(angle) * retake_latents
 
-            # Debug: how much perturbation vs source are we injecting in-window?
+            # only write the rotated noise inside the mask; keep *pure noise* outside
+            z0 = torch.where(repaint_mask == 1.0, repaint_noise, target_latents)
+
+            # (Optional) debug logs similar to your style
             with torch.no_grad():
                 m = (repaint_mask > 0).to(self.dtype)
                 denom = m.sum().clamp_min(1.0)
-                delta = ((z0 - x0) * m).pow(2).sum() / denom
+                # compare to pure noise baseline to indicate injected rotation power
+                delta = ((repaint_noise - target_latents) * m).pow(2).sum() / denom
                 delta_rms = torch.sqrt(torch.clamp(delta, 1e-12)).item()
-                logger.info(f"[REPAINT] noise alpha={alpha:.3f}  window_rms={_db(delta_rms):.1f} dB")
-                
-                # Sanity check: preserved region should stay put
-                keep_m = (repaint_mask == 0).to(self.dtype)
-                denom_keep = keep_m.sum().clamp_min(1.0)
-                drift = (((z0 - x0) * keep_m).pow(2).sum() / denom_keep).sqrt().item()
-                logger.info(f"[REPAINT] preserved_region drift_rms={_db(drift):.1f} dB (should be ≈ -inf)")
+                logger.info(f"[REPAINT] rotate α={alpha:.3f}  window_rms={_db(delta_rms):.1f} dB")
+                logger.info(f"[REPAINT] frames=({s_f},{e_f}) / {Tsrc} "
+                            f"(≈{s_f/_frames_per_second(44100):.2f}s→{e_f/_frames_per_second(44100):.2f}s)")
 
-            logger.info(f"[REPAINT] frames=({s_f},{e_f}) / {Tsrc} (≈{s_f/fps_out:.2f}s→{e_f/fps_out:.2f}s)")
-
-        else:  # extend (right-only to target total seconds in repaint_end_sec)
+        else:  # --- extend (right-only to target total seconds) ---
             target_total_sec = float(repaint_end_sec)
             want_f = max(Tsrc, sec_to_frames(target_total_sec, fps_src))
             cap_f = int(round(240.0 * fps_src))
             if want_f > cap_f:
                 raise ValueError(f"Extend target exceeds cap: want={want_f}f, cap={cap_f}f (240s)")
 
-            # pad tail only
             right_pad = max(0, want_f - Tsrc)
             if right_pad > 0:
                 # 1) expand source and prep mask container
                 x0 = torch.nn.functional.pad(x0, (0, right_pad), "constant", 0)
-                repaint_mask = torch.zeros_like(x0)
                 frame_length = x0.shape[-1]
+                repaint_mask = torch.zeros_like(x0)
                 is_extend = True
 
                 # 2) tile last EDGE seconds as tail motif
@@ -515,7 +520,7 @@ class ACEStepPipeline:
                 reps = (right_pad + edge.shape[-1] - 1) // edge.shape[-1]
                 tiled = edge.repeat(1, 1, 1, reps)[..., :right_pad]
 
-                # 3) latent seed crossfade exactly at seam (helps before denoiser acts)
+                # 3) latent seed crossfade exactly at seam (keeps perceptual continuity in x0)
                 ramp_L_seed = min(int(round(seam_seconds * fps_src)), right_pad)
                 if ramp_L_seed > 0:
                     fade = torch.linspace(0.0, 1.0, steps=ramp_L_seed,
@@ -523,84 +528,64 @@ class ACEStepPipeline:
                     cross = (1.0 - fade) * core[..., -ramp_L_seed:] + fade * tiled[..., :ramp_L_seed]
                     tiled = torch.cat([cross, tiled[..., ramp_L_seed:]], dim=-1)
 
-                z0 = torch.cat([core, tiled], dim=-1)
+                # x0 becomes (core + crossfaded tile) so the source trajectory is musical
+                x0 = torch.cat([core, tiled], dim=-1)
 
-                # keep stats stable for the vocoder
-                z0 = _match_rms_like(z0, x0)
-                z0 = _match_global_stats(z0, x0)
-
-                target_latents = z0.clone()
-
-                # 4) Seam-aware repaint mask:
-                # Make the mask reach 1.0 *at the last source frame* and keep 1.0 for all padded frames.
-                # This ensures the denoiser is already at full authority when the tail begins.
+                # 4) seam-aware repaint mask: ramp to 1.0 just before seam, then 1.0 over tail
                 pre_seconds = max(0.0, seam_seconds)
                 pre_L = min(int(round(pre_seconds * fps_src)), Tsrc)
-
                 seam_src_start = Tsrc - pre_L
                 seam_pad_start = Tsrc
 
-                # Pre-seam ramp **inside the source**: 0 → 1 so the final source frame is exactly 1.0
                 if pre_L > 0:
-                    pre_ramp = torch.linspace(
-                        0.0, 1.0, steps=pre_L, device=self.device, dtype=self.dtype
-                    )[None, None, None, :]
+                    pre_ramp = torch.linspace(0.0, 1.0, steps=pre_L,
+                                              device=self.device, dtype=self.dtype)[None, None, None, :]
                     repaint_mask[..., seam_src_start:Tsrc] = torch.maximum(
                         repaint_mask[..., seam_src_start:Tsrc], pre_ramp
                     )
-
-                # Post-seam (the padded tail): full repaint immediately
                 if right_pad > 0:
                     repaint_mask[..., seam_pad_start : seam_pad_start + right_pad] = 1.0
 
-                # Mix for *tail only*, controlled by α=retake_variance, relative to the tiled edge:
-                # tail_seed = (1-α)*tiled + α*noise_mix
+                # 5) (REQUIRED) re-sample ε1 to the NEW length
+                target_latents = randn_tensor(
+                    shape=(B, 8, 16, frame_length),
+                    generator=retake_random_generators,
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+
+                # 6) MATCH REPAINT SEEDING EXACTLY:
+                #    z0 is noise everywhere; inside the mask we rotate between ε1 and ε2.
                 alpha = float(retake_variance)
-                tail_start = Tsrc
-                tail_end   = Tsrc + right_pad
-                tail_slice = slice(tail_start, tail_end)
+                angle = torch.tensor(alpha * math.pi / 2, device=self.device, dtype=self.dtype)
 
-                tiled_seed = target_latents[..., tail_slice]  # current tiled/crossfaded seed
-                if alpha > 0.0:
-                    noise_b = randn_tensor(
-                        shape=tiled_seed.shape,
-                        generator=retake_random_generators,
-                        device=self.device,
-                        dtype=self.dtype,
-                    )
-                    angle = torch.tensor(alpha * math.pi / 2, device=self.device, dtype=self.dtype)
-                    noise_mix = torch.cos(angle) * tiled_seed + torch.sin(angle) * noise_b
-                    tail_seed = (1.0 - alpha) * tiled_seed + alpha * noise_mix
+                eps1 = target_latents  # current random init
+                eps2 = randn_tensor(
+                    shape=target_latents.shape,
+                    generator=retake_random_generators,
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+                rotated_noise = torch.cos(angle) * eps1 + torch.sin(angle) * eps2
+                z0 = torch.where(repaint_mask > 0, rotated_noise, eps1)  # noise-only seeding
 
-                    # Gentle ramp-in of the perturbation right after the seam
-                    pre_noise_ramp = min(int(round(0.25 * seam_seconds * fps_src)), right_pad)
-                    if pre_noise_ramp > 0:
-                        fade = torch.linspace(0.0, 1.0, steps=pre_noise_ramp,
-                                              device=self.device, dtype=self.dtype)[None, None, None, :]
-                        tail_seed[..., :pre_noise_ramp] = (
-                            (1.0 - fade) * tiled_seed[..., :pre_noise_ramp] +
-                            fade * tail_seed[..., :pre_noise_ramp]
-                        )
-                else:
-                    tail_seed = tiled_seed
-
-                # Apply the mixed seed to the tail in both target_latents and z0
-                target_latents[..., tail_slice] = tail_seed
-                z0[...,            tail_slice] = tail_seed
-
-                # Debug: perturbation vs the tiled seed (not vs zeros)
+                # (optional) debug
                 with torch.no_grad():
-                    delta = (tail_seed - tiled_seed).pow(2).mean().sqrt().item()
-                    logger.info(f"[EXTEND] noise alpha={alpha:.3f}  tail_rms={_db(delta):.1f} dB")
+                    m = (repaint_mask > 0).to(self.dtype)
+                    denom = m.sum().clamp_min(1.0)
+                    delta = ((rotated_noise - eps1) * m).pow(2).sum() / denom
+                    delta_rms = torch.sqrt(torch.clamp(delta, 1e-12)).item()
+                    logger.info(f"[EXTEND] rotate α={alpha:.3f}  masked_rms={_db(delta_rms):.1f} dB")
 
                 logger.info(
                     f"[EXTEND] src={Tsrc}f (≈{Tsrc/fps_src:.2f}s) → new={frame_length}f "
                     f"(+{right_pad}f), seam_pre={pre_L}f (mask hits 1.0 at seam)"
                 )
+
             else:
+                # no right pad; nothing to repaint
                 repaint_mask = torch.zeros_like(x0)
-                z0 = x0.clone()
-                target_latents = x0.clone()
+                z0 = target_latents  # any noise; will be ignored since mask==0
                 logger.info("[EXTEND] right_pad=0 (target length ≤ source length); no repaint region.")
 
         # timesteps
@@ -622,11 +607,11 @@ class ACEStepPipeline:
         # guidance window
         start_idx = int(num_steps * ((1 - guidance_interval) / 2))
         end_idx = int(num_steps * (guidance_interval / 2 + 0.5))
-        if is_extend:
-            start_idx, end_idx = 0, num_steps
-            guidance_interval_decay = 1.2 if guidance_interval_decay == 0.0 else guidance_interval_decay
-            min_guidance_scale = max(6.0, float(min_guidance_scale))
-            omega_scale = min(10.0, float(omega_scale))
+        # if is_extend:
+        #     start_idx, end_idx = 0, num_steps
+        #     guidance_interval_decay = 1.2 if guidance_interval_decay == 0.0 else guidance_interval_decay
+        #     min_guidance_scale = max(6.0, float(min_guidance_scale))
+        #     omega_scale = min(10.0, float(omega_scale))
 
         attn_mask = torch.ones(B, frame_length, device=self.device, dtype=torch.bool)
         momentum = MomentumBuffer()
