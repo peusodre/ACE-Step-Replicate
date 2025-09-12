@@ -7,6 +7,7 @@ import tempfile
 import inspect
 from typing import Optional
 from cog import BasePredictor, Input, Path
+from loguru import logger
 
 import torch
 from acestep.pipeline_ace_step import ACEStepPipeline
@@ -113,7 +114,7 @@ class Predictor(BasePredictor):
         lora_name_or_path: str = Input(default="none"),
         lora_weight: float = Input(default=1.0, ge=0.0, le=2.0),
         output_format: str = Input(default="wav", choices=["wav", "mp3", "ogg"]),
-        sample_rate: int = Input(default=48000, choices=[44100, 48000]),
+        sample_rate: int = Input(default=44100, choices=[44100, 48000]),
     ) -> Path:
         # temp workspace + materialize input
         temp_dir = tempfile.mkdtemp()
@@ -193,5 +194,14 @@ class Predictor(BasePredictor):
         if unknown:
             raise RuntimeError(f"predictor kwarg(s) not in pipeline signature: {unknown}")
 
-        output_paths = self.pipeline(**kwargs)
-        return Path(output_paths[0])
+        try:
+            output_paths = self.pipeline(**kwargs)
+            if not output_paths or len(output_paths) == 0:
+                raise RuntimeError("Pipeline returned no output files")
+            output_path = output_paths[0]
+            if not os.path.exists(output_path):
+                raise RuntimeError(f"Output file does not exist: {output_path}")
+            return Path(output_path)
+        except Exception as e:
+            logger.error(f"Pipeline execution failed: {e}")
+            raise

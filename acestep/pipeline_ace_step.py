@@ -42,7 +42,17 @@ from acestep.apg_guidance import apg_forward, MomentumBuffer, cfg_forward, cfg_z
 from acestep.language_segmentation import LangSegment, language_filters
 from acestep.models.lyrics_utils.lyric_tokenizer import VoiceBpeTokenizer
 
-from .cpu_offload import cpu_offload
+# NOTE: Use a non-relative import so this file can run both
+# as a package module *and* as a flat script in Replicate/Cog.
+# If your project is packaged and this file is inside the
+# 'acestep' package, you may also use:
+#   from acestep.cpu_offload import cpu_offload
+# but avoid a leading dot unless you are sure package imports
+# are set up correctly.
+try:
+    from cpu_offload import cpu_offload
+except ImportError:
+    from .cpu_offload import cpu_offload
 
 
 # ---- torch runtime knobs -----------------------------------------------------
@@ -67,10 +77,6 @@ def _frames_per_second(sample_rate: int) -> float:
 
 def _rms(v: torch.Tensor, eps: float = 1e-12) -> float:
     return float(torch.sqrt(torch.clamp((v.float() ** 2).mean(), eps)).detach().cpu())
-
-def _rms_t(x: torch.Tensor) -> float:
-    # Back-compat alias for older debug statements
-    return _rms(x)
 
 def _db(x: float, floor: float = -80.0) -> float:
     if x <= 0:
@@ -309,10 +315,14 @@ class ACEStepPipeline:
     def infer_latents(self, input_audio_path: Optional[str]) -> Optional[torch.Tensor]:
         if input_audio_path is None:
             return None
-        audio, sr = self.music_dcae.load_audio(input_audio_path)
-        audio = audio.unsqueeze(0).to(device=self.device, dtype=self.dtype)
-        latents, _ = self.music_dcae.encode(audio, sr=sr)
-        return latents
+        try:
+            audio, sr = self.music_dcae.load_audio(input_audio_path)
+            audio = audio.unsqueeze(0).to(device=self.device, dtype=self.dtype)
+            latents, _ = self.music_dcae.encode(audio, sr=sr)
+            return latents
+        except Exception as e:
+            logger.error(f"Failed to load/encode audio from {input_audio_path}: {e}")
+            return None
 
     @cpu_offload("music_dcae")
     def latents2audio(
@@ -349,9 +359,34 @@ class ACEStepPipeline:
                 else save_path
             )
 
-        backend = "sox_io" if format.lower() == "ogg" else "soundfile"
-        logger.info(f"Saving audio to {out} (backend={backend})")
-        torchaudio.save(out, wav.float(), sample_rate=sample_rate, format=format, backend=backend)
+        # torchaudio.save no longer accepts a 'backend=' kwarg.
+        # Also, MP3/OGG may be unavailable depending on libsndfile/ffmpeg in the image.
+        fmt = (format or "wav").lower()
+        try:
+            if fmt in ("wav", "ogg"):
+                torchaudio.save(out, wav.float(), sample_rate=sample_rate, format=fmt)
+            elif fmt == "mp3":
+                try:
+                    torchaudio.save(out, wav.float(), sample_rate=sample_rate, format="mp3")
+                except Exception as e:
+                    logger.warning(f"MP3 save failed ({e}); falling back to WAV.")
+                    out = out.rsplit(".", 1)[0] + ".wav"
+                    torchaudio.save(out, wav.float(), sample_rate=sample_rate, format="wav")
+            else:
+                logger.warning(f"Unknown format '{format}', saving as WAV instead.")
+                out = out.rsplit(".", 1)[0] + ".wav"
+                torchaudio.save(out, wav.float(), sample_rate=sample_rate, format="wav")
+        except Exception as e:
+            # Final safety net: always try WAV
+            logger.warning(f"Primary save failed ({e}); attempting WAV fallback.")
+            try:
+                out = out.rsplit(".", 1)[0] + ".wav"
+            except Exception:
+                # If 'out' has no extension
+                out = f"{out}.wav"
+            torchaudio.save(out, wav.float(), sample_rate=sample_rate, format="wav")
+
+        logger.info(f"Saved audio to {out}")
         return out
 
     # ---- core diffusion (extend/repaint) ------------------------------------
@@ -369,7 +404,6 @@ class ACEStepPipeline:
         prompt_mask: torch.Tensor,      # (B, L)
         lyric_ids: torch.Tensor,        # (B, L_lyr)
         lyric_mask: torch.Tensor,       # (B, L_lyr)
-        *,
         infer_steps: int,
         scheduler_type: str,
         cfg_type: str,
@@ -408,7 +442,7 @@ class ACEStepPipeline:
         def sec_to_frames(sec: float, fps: float) -> int:
             return int(round(max(0.0, sec) * fps))
 
-        # create initial target latents
+        # create initial target latents (pure noise)
         target_latents = randn_tensor(
             shape=(B, 8, 16, frame_length),
             generator=retake_random_generators,
@@ -423,7 +457,7 @@ class ACEStepPipeline:
 
         if task == "repaint":
             s_f = min(Tsrc, sec_to_frames(repaint_start_sec, fps_out))
-            e_f = min(Tsrc, sec_to_frames(repaint_end_sec, fps_out))
+            e_f = min(Tsrc, sec_to_frames(repaint_end_sec,   fps_out))
             if e_f <= s_f:
                 raise ValueError("repaint_end must be > repaint_start")
 
@@ -453,26 +487,27 @@ class ACEStepPipeline:
             # pad tail only
             right_pad = max(0, want_f - Tsrc)
             if right_pad > 0:
+                # 1) expand source and prep mask container
                 x0 = torch.nn.functional.pad(x0, (0, right_pad), "constant", 0)
                 repaint_mask = torch.zeros_like(x0)
-                repaint_mask[..., -right_pad:] = 1.0
                 frame_length = x0.shape[-1]
                 is_extend = True
 
-                # tile last EDGE seconds as a motif for the tail
+                # 2) tile last EDGE seconds as tail motif
                 EDGE = max(64, sec_to_frames(extend_bootstrap_edge_sec, fps_src))
                 core = x0[..., :Tsrc]
-                edge = _avg_time(x0[..., Tsrc - EDGE:Tsrc] if Tsrc >= EDGE else x0[..., :Tsrc], k=7)
+                edge = _avg_time(x0[..., Tsrc-EDGE:Tsrc] if Tsrc >= EDGE else x0[..., :Tsrc], k=7)
 
                 reps = (right_pad + edge.shape[-1] - 1) // edge.shape[-1]
                 tiled = edge.repeat(1, 1, 1, reps)[..., :right_pad]
 
-                # cosine crossfade at seam
-                ramp_L = min(int(round(seam_seconds * fps_src)), right_pad)
-                if ramp_L > 0:
-                    fade = torch.linspace(0.0, 1.0, steps=ramp_L, device=self.device, dtype=self.dtype)[None, None, None, :]
-                    cross = (1.0 - fade) * core[..., -ramp_L:] + fade * tiled[..., :ramp_L]
-                    tiled = torch.cat([cross, tiled[..., ramp_L:]], dim=-1)
+                # 3) latent seed crossfade exactly at seam (helps before denoiser acts)
+                ramp_L_seed = min(int(round(seam_seconds * fps_src)), right_pad)
+                if ramp_L_seed > 0:
+                    fade = torch.linspace(0.0, 1.0, steps=ramp_L_seed,
+                                          device=self.device, dtype=self.dtype)[None, None, None, :]
+                    cross = (1.0 - fade) * core[..., -ramp_L_seed:] + fade * tiled[..., :ramp_L_seed]
+                    tiled = torch.cat([cross, tiled[..., ramp_L_seed:]], dim=-1)
 
                 z0 = torch.cat([core, tiled], dim=-1)
 
@@ -482,13 +517,43 @@ class ACEStepPipeline:
 
                 target_latents = z0.clone()
 
-                # soften the seam
-                if ramp_L > 0:
-                    s = frame_length - right_pad
-                    ramp = torch.linspace(0.0, 1.0, steps=ramp_L, device=self.device, dtype=self.dtype)[None, None, None, :]
-                    repaint_mask[..., s:s + ramp_L] = ramp
+                # 4) two-sided repaint mask around the seam
+                post_seconds = seam_seconds
+                pre_seconds  = min(seam_seconds * 0.5, (Tsrc / fps_src) * 0.25)
+                alpha_inside = 0.4  # gentle authority inside source
 
-                logger.info(f"[EXTEND] src={Tsrc}f → new={frame_length}f (+{right_pad}f), seam={ramp_L}f")
+                pre_L  = min(int(round(pre_seconds  * fps_src)), Tsrc)
+                post_L = min(int(round(post_seconds * fps_src)), right_pad)
+
+                seam_src_start = Tsrc - pre_L
+                seam_pad_start = Tsrc
+
+                if pre_L > 0:
+                    pre_ramp = torch.linspace(0.0, float(alpha_inside), steps=pre_L,
+                                              device=self.device, dtype=self.dtype)[None, None, None, :]
+                    repaint_mask[..., seam_src_start:Tsrc] = torch.maximum(
+                        repaint_mask[..., seam_src_start:Tsrc], pre_ramp
+                    )
+
+                if post_L > 0:
+                    post_ramp = torch.linspace(0.0, 1.0, steps=post_L,
+                                               device=self.device, dtype=self.dtype)[None, None, None, :]
+                    repaint_mask[..., seam_pad_start:seam_pad_start + post_L] = torch.maximum(
+                        repaint_mask[..., seam_pad_start:seam_pad_start + post_L], post_ramp
+                    )
+
+                if right_pad > post_L:
+                    repaint_mask[..., seam_pad_start + post_L : Tsrc + right_pad] = 1.0
+
+                logger.info(
+                    f"[EXTEND] src={Tsrc}f (≈{Tsrc/fps_src:.2f}s) → new={frame_length}f "
+                    f"(+{right_pad}f), seam_pre={pre_L}f, seam_post={post_L}f, alpha_inside={alpha_inside}"
+                )
+            else:
+                repaint_mask = torch.zeros_like(x0)
+                z0 = x0.clone()
+                target_latents = x0.clone()
+                logger.info("[EXTEND] right_pad=0 (target length ≤ source length); no repaint region.")
 
         # timesteps
         timesteps, num_steps = retrieve_timesteps(
@@ -518,7 +583,8 @@ class ACEStepPipeline:
         attn_mask = torch.ones(B, frame_length, device=self.device, dtype=torch.bool)
         momentum = MomentumBuffer()
 
-        # choose a low-noise repaint start for stability
+        # repaint strength → choose step index where masked ODE-like blending begins
+        # (no sigma capping/override; this is the only place we decide "when to start")
         repaint_frac = float(retake_variance)
         n_min = max(1, min(int(infer_steps * (1 - repaint_frac)), infer_steps - 2))
 
@@ -566,7 +632,7 @@ class ACEStepPipeline:
                         guidance_scale=cfg_now, i=i, zero_steps=1, use_zero_init=True
                     )
                 else:
-                    noise = cond  # fallback (shouldn't happen with valid cfg_type)
+                    noise = cond  # fallback
             else:
                 # unconditional evolution (no explicit guidance mixing)
                 timestep = t.expand(latents.shape[0])
@@ -716,6 +782,8 @@ class ACEStepPipeline:
 
         # src latents
         src_latents = self.infer_latents(src_audio_path)
+        if src_latents is None:
+            raise ValueError(f"Failed to load audio from {src_audio_path}")
 
         # run diffusion
         t0 = time.time()
