@@ -52,7 +52,7 @@ from acestep.models.lyrics_utils.lyric_tokenizer import VoiceBpeTokenizer
 try:
     from cpu_offload import cpu_offload
 except ImportError:
-    from .cpu_offload import cpu_offload
+from .cpu_offload import cpu_offload
 
 
 # ---- torch runtime knobs -----------------------------------------------------
@@ -188,7 +188,7 @@ class ACEStepPipeline:
             if all(os.path.exists(os.path.join(checkpoint_dir, d)) for d in required):
                 logger.info(f"Using local checkpoints: {checkpoint_dir}")
                 checkpoint_dir_models = checkpoint_dir
-
+        
         if checkpoint_dir_models is None:
             if checkpoint_dir is None:
                 logger.info(f"Downloading models from HF: {repo_id}")
@@ -351,7 +351,7 @@ class ACEStepPipeline:
             base = "./outputs"
             ensure_directory_exists(base)
             out = f"{base}/output_{time.strftime('%Y%m%d%H%M%S')}_{idx}.{format}"
-        else:
+                else:
             ensure_directory_exists(os.path.dirname(save_path) or ".")
             out = (
                 os.path.join(save_path, f"output_{time.strftime('%Y%m%d%H%M%S')}_{idx}.{format}")
@@ -372,7 +372,7 @@ class ACEStepPipeline:
                     logger.warning(f"MP3 save failed ({e}); falling back to WAV.")
                     out = out.rsplit(".", 1)[0] + ".wav"
                     torchaudio.save(out, wav.float(), sample_rate=sample_rate, format="wav")
-            else:
+                else:
                 logger.warning(f"Unknown format '{format}', saving as WAV instead.")
                 out = out.rsplit(".", 1)[0] + ".wav"
                 torchaudio.save(out, wav.float(), sample_rate=sample_rate, format="wav")
@@ -577,8 +577,8 @@ class ACEStepPipeline:
                 logger.info(
                     f"[EXTEND] src={Tsrc}f (≈{Tsrc/fps_src:.2f}s) → new={frame_length}f "
                     f"(+{right_pad}f), seam_pre={pre_L}f (mask hits 1.0 at seam)"
-                )
-            else:
+            )
+        else:
                 repaint_mask = torch.zeros_like(x0)
                 z0 = x0.clone()
                 target_latents = x0.clone()
@@ -639,12 +639,12 @@ class ACEStepPipeline:
                     hidden_states=latents, attention_mask=attn_mask,
                     encoder_hidden_states=enc_states, encoder_hidden_mask=enc_mask,
                     output_length=out_len, timestep=timestep
-                ).sample
+                    ).sample
                 uncond = self.ace_step_transformer.decode(
                     hidden_states=latents, attention_mask=attn_mask,
                     encoder_hidden_states=enc_states_null, encoder_hidden_mask=enc_mask,
                     output_length=out_len, timestep=timestep
-                ).sample
+                    ).sample
 
                 if cfg_type == "apg":
                     noise = apg_forward(
@@ -660,7 +660,7 @@ class ACEStepPipeline:
                         noise_pred_with_cond=cond, noise_pred_uncond=uncond,
                         guidance_scale=cfg_now, i=i, zero_steps=1, use_zero_init=True
                     )
-                else:
+            else:
                     noise = cond  # fallback
             else:
                 # unconditional evolution (no explicit guidance mixing)
@@ -712,22 +712,22 @@ class ACEStepPipeline:
             return
 
         # load/update
-        if not os.path.exists(lora_name_or_path):
-            lora_download_path = snapshot_download(lora_name_or_path, cache_dir=self.checkpoint_dir)
-        else:
-            lora_download_path = lora_name_or_path
-        if self.lora_path != "none":
-            self.ace_step_transformer.unload_lora()
+            if not os.path.exists(lora_name_or_path):
+                lora_download_path = snapshot_download(lora_name_or_path, cache_dir=self.checkpoint_dir)
+            else:
+                lora_download_path = lora_name_or_path
+            if self.lora_path != "none":
+                self.ace_step_transformer.unload_lora()
 
         self.ace_step_transformer.load_lora_adapter(
             os.path.join(lora_download_path, "pytorch_lora_weights.safetensors"),
             adapter_name="ace_step_lora", with_alpha=True, prefix=None
         )
         from diffusers.utils.peft_utils import set_weights_and_activate_adapters
-        set_weights_and_activate_adapters(self.ace_step_transformer, ["ace_step_lora"], [lora_weight])
+            set_weights_and_activate_adapters(self.ace_step_transformer, ["ace_step_lora"], [lora_weight])
 
-        self.lora_path = lora_name_or_path
-        self.lora_weight = lora_weight
+            self.lora_path = lora_name_or_path
+            self.lora_weight = lora_weight
         logger.info(f"[LORA] loaded {lora_name_or_path} (weight={lora_weight})")
 
     def __call__(
@@ -787,7 +787,7 @@ class ACEStepPipeline:
 
         if not self.loaded:
             logger.info("Loading checkpoints…")
-            self.load_checkpoint(self.checkpoint_dir)
+                self.load_checkpoint(self.checkpoint_dir)
 
         # LoRA
         self.load_lora(lora_name_or_path, float(lora_weight))
@@ -810,7 +810,7 @@ class ACEStepPipeline:
             lyric_mask = torch.tensor([0], device=self.device).repeat(batch_size, 1).long()
 
         # src latents
-        src_latents = self.infer_latents(src_audio_path)
+            src_latents = self.infer_latents(src_audio_path)
         if src_latents is None:
             raise ValueError(f"Failed to load audio from {src_audio_path}")
 
@@ -818,16 +818,16 @@ class ACEStepPipeline:
         t0 = time.time()
         latents = self._extend_repaint_diffusion(
             task=task,
-            src_latents=src_latents,
+                src_latents=src_latents,
             repaint_start_sec=float(repaint_start),
             repaint_end_sec=float(repaint_end),
             prompt_hid=prompt_hid,
             prompt_mask=prompt_mask,
             lyric_ids=lyric_ids,
-            lyric_mask=lyric_mask,
+                lyric_mask=lyric_mask,
             infer_steps=int(infer_step),
-            scheduler_type=scheduler_type,
-            cfg_type=cfg_type,
+                scheduler_type=scheduler_type,
+                cfg_type=cfg_type,
             guidance_scale=float(guidance_scale),
             omega_scale=float(omega_scale),
             guidance_interval=float(guidance_interval),
